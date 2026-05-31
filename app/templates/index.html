@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 训练日志填写</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260531-11" />
+  </head>
+  <body>
+    <section id="login-screen" class="login-screen">
+      <form id="login-form" class="login-card">
+        <p class="eyebrow">User Login</p>
+        <h1>训练日志系统登录</h1>
+        <p class="subtle">请选择自己的账号登录，API 配置会按用户分别保存。</p>
+        <label class="field">
+          <span>用户名</span>
+          <input id="login-username" name="username" type="text" autocomplete="username" placeholder="admin / student1 / student2" required />
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="请输入你的账号密码" required />
+        </label>
+        <div class="actions">
+          <button type="submit">登录</button>
+          <span id="login-status"></span>
+        </div>
+      </form>
+    </section>
+
+    <main id="app-shell" class="shell hidden">
+      <button id="api-settings-toggle" class="settings-toggle" type="button" aria-label="打开设置" title="设置">⚙</button>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Docker AI Training Log Filler</p>
+          <h1>上传训练日志模板，自动生成并写入内容</h1>
+          <p class="subtle">支持保存 API 配置、读取每月训练要求网址，并把 AI 生成内容写回 DOCX 模板。</p>
+        </div>
+        <div class="user-chip">
+          <span id="current-user-name">未登录</span>
+          <button id="logout-button" type="button" class="secondary mini">退出</button>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <form id="fill-form" class="panel">
+          <section id="api-settings-panel" class="api-settings-panel hidden" aria-label="设置">
+            <div class="settings-card">
+              <div class="settings-head">
+                <h2>设置</h2>
+                <button id="api-settings-close" class="secondary mini" type="button" aria-label="关闭设置">关闭</button>
+              </div>
+          <div class="api-grid">
+            <label class="field">
+              <span>兼容格式</span>
+              <select id="api-format" name="api_format">
+                <option value="openai" selected>OpenAI 兼容 / Chat Completions</option>
+                <option value="ollama">Ollama / 本地模型</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>模型</span>
+              <select id="api-model" name="api_model">
+                <option value="minimax-m25">minimax-m25</option>
+              </select>
+            </label>
+          </div>
+
+          <section class="auth-switch-card">
+            <label class="checkline">
+              <input id="require-password" type="checkbox" checked />
+              <span>进入系统需要登录密码</span>
+            </label>
+            <span id="auth-settings-status"></span>
+          </section>
+
+          <label class="field">
+            <span>模型组（同一 API 地址可用模型，一行一个）</span>
+            <textarea id="api-models" rows="3" spellcheck="false" placeholder="minimax-m25&#10;minimax-text-01&#10;minimax-reasoning"></textarea>
+          </label>
+          <div class="model-group-actions">
+            <button id="apply-model-group" type="button" class="secondary">确定模型组</button>
+            <button id="fetch-models" type="button" class="secondary">获取模型</button>
+            <span id="model-group-status"></span>
+          </div>
+
+          <label class="field">
+            <span>API 地址</span>
+            <input id="api-base-url" name="api_base_url" type="url" placeholder="https://api.openai.com/v1" />
+          </label>
+
+          <label id="gpu-model-field" class="field hidden">
+            <span>GPU 型号（Ollama 显示/保存用）</span>
+            <input id="api-gpu-model" name="gpu_model" list="gpu-options" type="text" placeholder="自动读取后选择，也可手动填写" />
+            <datalist id="gpu-options"></datalist>
+          </label>
+          <div id="gpu-actions" class="model-group-actions hidden">
+            <button id="fetch-gpus" type="button" class="secondary">读取 GPU</button>
+            <span id="gpu-status"></span>
+          </div>
+
+          <section class="api-presets">
+            <div class="list-head">
+              <span>API 快速配置</span>
+              <button id="add-api-preset" type="button" class="secondary mini">新建配置</button>
+            </div>
+            <div id="api-preset-list" class="preset-list"></div>
+          </section>
+
+          <label id="api-key-field" class="field">
+            <span>API 密钥</span>
+            <div class="secret-row">
+              <input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="sk-...；Ollama 可留空" />
+              <button id="toggle-api-key" type="button" class="secondary mini">显示</button>
+            </div>
+          </label>
+
+          <div class="config-actions">
+            <label class="checkline">
+              <input id="save-config" name="save_config" type="checkbox" value="true" />
+              <span>本次生成后保存 API 配置</span>
+            </label>
+            <button id="save-config-now" type="button" class="secondary">保存配置</button>
+            <button id="test-api" type="button" class="secondary">测试 API</button>
+            <button id="preload-model" type="button" class="secondary hidden">预加载模型</button>
+            <button id="restart-model" type="button" class="secondary hidden">重启模型</button>
+            <button id="unload-model" type="button" class="secondary hidden">关闭模型</button>
+            <span id="api-test-status"></span>
+          </div>
+
+          <section class="account-backup">
+            <div class="list-head">
+              <span>配置备份</span>
+            </div>
+            <div class="config-actions">
+              <button id="export-account-data" type="button" class="secondary">导出配置</button>
+              <button id="restore-account-data" type="button" class="secondary">导入配置</button>
+              <input id="restore-account-file" type="file" accept="application/json,.json" hidden />
+              <span id="account-backup-status"></span>
+            </div>
+          </section>
+
+          <section class="module-config">
+            <div class="module-head">
+              <h3>模块选项</h3>
+              <label class="checkline">
+                <input id="link-module-teacher" name="link_module_teacher" type="checkbox" value="true" />
+                <span>开启模块和老师关联</span>
+              </label>
+            </div>
+
+            <div class="module-options">
+              <label class="module-option">
+                <input class="module-check" type="checkbox" value="A" checked />
+                <span>A 模块</span>
+              </label>
+              <label class="module-option">
+                <input class="module-check" type="checkbox" value="B" checked />
+                <span>B 模块</span>
+              </label>
+              <label class="module-option">
+                <input class="module-check" type="checkbox" value="C" checked />
+                <span>C 模块</span>
+              </label>
+            </div>
+
+            <input id="selected-modules" name="selected_modules" type="hidden" value='["A","B","C"]' />
+            <input id="module-teacher-map" name="module_teacher_map" type="hidden" value="{}" />
+
+            <div class="dynamic-config">
+              <div class="dynamic-list">
+                <div class="list-head">
+                  <span>模块</span>
+                  <button id="add-module" type="button" class="secondary mini">新增模块</button>
+                </div>
+                <div id="module-list" class="config-list"></div>
+              </div>
+              <div class="dynamic-list">
+                <div class="list-head">
+                  <span>授课老师</span>
+                  <button id="add-teacher" type="button" class="secondary mini">新增老师</button>
+                </div>
+                <div id="teacher-list" class="config-list"></div>
+              </div>
+            </div>
+          </section>
+            </div>
+          </section>
+
+          <section class="fill-mode">
+            <span>填写方式</span>
+            <input id="batch-mode" name="batch_mode" type="checkbox" value="true" checked hidden />
+            <div class="mode-buttons" role="group" aria-label="填写方式">
+              <button id="batch-fill-mode" type="button" class="mode-button active" aria-pressed="true">批量填写</button>
+              <button id="manual-mode" type="button" class="mode-button" aria-pressed="false">手动填写</button>
+            </div>
+          </section>
+
+          <section class="mode-panel common-fill-panel">
+          <div class="api-grid manual-fill-panel">
+            <label class="field">
+              <span>起始日期</span>
+              <input id="start-date" name="start_date" type="date" />
+            </label>
+            <label class="field">
+              <span>授课老师/负责教练</span>
+              <select id="default-coach" name="default_coach">
+                <option value="">请选择授课老师</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>填写人</span>
+            <input id="default-writer" name="default_writer" type="text" placeholder="例如：填写人姓名" />
+          </label>
+
+          <label class="field quick-api-select-field">
+            <span>API 选择</span>
+            <select id="quick-api-select">
+              <option value="">请选择 API 配置</option>
+            </select>
+          </label>
+
+          <div class="actions import-actions quick-api-actions">
+            <button id="quick-api-test" type="button" class="secondary">API 测试</button>
+            <button id="quick-api-settings-detail" type="button" class="secondary">详细设置</button>
+            <button id="quick-preload-model" type="button" class="secondary hidden">预加载模型</button>
+            <button id="quick-restart-model" type="button" class="secondary hidden">重启模型</button>
+            <button id="quick-unload-model" type="button" class="secondary hidden">关闭模型</button>
+            <span id="current-api-summary" class="api-summary">当前 API：未加载</span>
+          </div>
+          </section>
+
+          <section id="auto-fill-panel" class="mode-panel auto-fill-panel hidden">
+          <section class="requirements-source-mode">
+            <span>任务来源</span>
+            <input id="requirements-source-mode" type="hidden" value="text" />
+            <div class="mode-buttons" role="group" aria-label="任务来源">
+              <button id="requirements-text-mode" type="button" class="mode-button active" aria-pressed="true">手动导入</button>
+              <button id="requirements-link-mode" type="button" class="mode-button" aria-pressed="false">链接提取</button>
+            </div>
+          </section>
+
+          <label class="field requirements-link-source">
+            <span>每日/每月任务文档链接</span>
+            <input id="requirements-url" name="requirements_url" type="url" placeholder="https://example.com/monthly-training-requirements" />
+          </label>
+
+          <label class="field requirements-text-source">
+            <span>训练计划 Excel（推荐，支持 XLSX/CSV）</span>
+            <input id="plan-file" name="plan_file" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" />
+          </label>
+
+          <div class="actions import-actions requirements-text-source">
+            <button id="parse-plan-file" type="button" class="secondary">解析上传的表格</button>
+            <span id="plan-file-status"></span>
+          </div>
+          </section>
+
+          <section id="manual-fill-panel" class="mode-panel manual-fill-panel">
+          <label class="field">
+            <span>模块</span>
+            <select id="manual-module" name="manual_module">
+              <option value="">请选择模块</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>训练内容</span>
+            <textarea id="manual-training-content" name="manual_training_content" spellcheck="false" placeholder="填写本次要生成训练日志的训练任务或训练内容。"></textarea>
+          </label>
+
+          <div class="actions import-actions">
+            <button id="open-requirements" type="button" class="secondary">打开文档登录/查看</button>
+          </div>
+          </section>
+
+          <section id="auto-fill-extra-panel" class="mode-panel auto-fill-panel hidden">
+          <details class="advanced-auth requirements-link-source">
+            <summary>高级授权（登录后仍读不到时使用）</summary>
+            <label class="field">
+              <span>Cookie</span>
+              <textarea id="requirements-cookie" name="requirements_cookie" spellcheck="false" placeholder="从浏览器开发者工具复制请求 Cookie。只建议在本机使用。"></textarea>
+            </label>
+            <label class="field">
+              <span>User-Agent</span>
+              <input id="requirements-user-agent" name="requirements_user_agent" type="text" placeholder="可留空，默认模拟 Chrome" />
+            </label>
+            <label class="field">
+              <span>Referer</span>
+              <input id="requirements-referer" name="requirements_referer" type="url" placeholder="通常可填金山文档链接本身，也可留空" />
+            </label>
+          </details>
+
+          <label class="field requirements-link-source">
+            <span>任务文档内容（链接读不到时粘贴正文）</span>
+            <textarea id="requirements-text" name="requirements_text" spellcheck="false" placeholder="打开金山文档后，把本月/每日任务内容复制到这里。填写后会优先使用这里的内容。"></textarea>
+          </label>
+
+          <div class="actions import-actions requirements-link-source">
+            <button id="import-plan" type="button" class="secondary">导入训练计划</button>
+            <span id="import-status"></span>
+          </div>
+
+          <section id="plan-picker" class="plan-picker hidden">
+            <div class="picker-head">
+              <h3>选择要生成的对象</h3>
+              <button id="toggle-all-records" type="button" class="secondary mini">全选/反选</button>
+            </div>
+            <div id="plan-records" class="plan-records"></div>
+          </section>
+          </section>
+
+          <input id="selected-records" name="selected_records" type="hidden" />
+
+          <label class="field">
+            <span>下载格式</span>
+            <select id="output-format" name="output_format">
+              <option value="docx" selected>DOCX 文档</option>
+              <option value="pdf">PDF 文件</option>
+            </select>
+          </label>
+
+          <label class="field auto-fill-panel hidden">
+            <span>批量下载方式</span>
+            <select id="output-package-mode" name="output_package_mode">
+              <option value="folder" selected>生成文件夹（不压缩）</option>
+              <option value="zip_folder">生成压缩包文件夹（ZIP 内含文件夹）</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>训练日志模板（可不传，默认使用已内置模板）</span>
+            <input id="file" name="file" type="file" accept=".pdf,.docx,.txt,.md" />
+          </label>
+          <div class="actions import-actions template-preview-actions">
+            <button id="preview-template" type="button" class="secondary">预览模板</button>
+            <span id="template-preview-status"></span>
+          </div>
+          <section id="template-preview-panel" class="template-preview-panel hidden">
+            <div class="preview-head">
+              <h3>模板预览</h3>
+              <span id="template-preview-name"></span>
+            </div>
+            <div id="template-preview-fields" class="template-preview-fields"></div>
+            <pre id="template-preview-text" class="template-preview-text"></pre>
+          </section>
+
+          <section class="custom-mode">
+            <span>生成要求来源</span>
+            <input id="custom-mode" name="custom_mode" type="hidden" value="prompt" />
+            <div class="mode-buttons" role="group" aria-label="生成要求来源">
+              <button id="prompt-mode" type="button" class="mode-button active" aria-pressed="true">提示词</button>
+              <button id="skills-mode" type="button" class="mode-button" aria-pressed="false">Skills</button>
+            </div>
+          </section>
+
+          <section class="prompt-presets custom-source prompt-source">
+            <label class="field">
+              <span>提示词配置</span>
+              <select id="prompt-preset-select"></select>
+            </label>
+            <div class="actions prompt-preset-actions">
+              <button id="new-prompt-preset" type="button" class="secondary mini">新建提示词</button>
+              <button id="save-prompt-preset" type="button" class="secondary mini">保存提示词</button>
+              <button id="delete-prompt-preset" type="button" class="secondary mini">删除提示词</button>
+              <span id="prompt-preset-status"></span>
+            </div>
+          </section>
+
+          <label class="field custom-source prompt-source">
+            <span>自定义提示词（可选）</span>
+            <textarea id="custom-prompt" name="custom_prompt" rows="4" spellcheck="false" placeholder="例如：学习笔记要更像学生个人复盘；总结不要写太空泛；每条内容围绕实际命令、配置、验证结果展开。"></textarea>
+          </label>
+
+          <section class="prompt-presets custom-source skills-source hidden">
+            <label class="field">
+              <span>Skills 配置</span>
+              <select id="skills-preset-select"></select>
+            </label>
+            <div class="actions prompt-preset-actions">
+              <button id="new-skills-preset" type="button" class="secondary mini">新建 Skills</button>
+              <button id="save-skills-preset" type="button" class="secondary mini">保存 Skills</button>
+              <button id="delete-skills-preset" type="button" class="secondary mini">删除 Skills</button>
+              <span id="skills-preset-status"></span>
+            </div>
+          </section>
+
+          <label class="field custom-source skills-source hidden">
+            <span>自定义 skills / 能力要求（可选，一行一个）</span>
+            <textarea id="custom-skills" name="custom_skills" rows="4" spellcheck="false" placeholder="例如：Linux 服务配置复盘&#10;网络排错步骤拆解&#10;Windows Server 角色服务总结"></textarea>
+          </label>
+
+          <label class="field">
+            <span>要填写的字段（可留空，DOCX 模板会自动识别）</span>
+            <textarea id="form-schema" name="form_schema" spellcheck="false">日期
+星期
+时间
+模块
+训练计划
+负责教练
+授课老师
+训练模块
+训练任务
+训练内容
+学习笔记
+总结
+填写人</textarea>
+          </label>
+
+          <div class="actions">
+            <button type="submit">生成并写入</button>
+            <button id="copy-json" type="button" class="secondary" disabled>复制结果 JSON</button>
+          </div>
+        </form>
+
+        <div id="workspace-resizer" class="workspace-resizer" role="separator" aria-label="调整左右面板宽度" aria-orientation="vertical" tabindex="0"></div>
+
+        <section class="panel result-panel">
+          <div class="result-head">
+            <h2>填写结果</h2>
+            <span id="ai-status">等待上传</span>
+          </div>
+          <section id="preview-panel" class="preview-panel hidden">
+            <div class="preview-head">
+              <h3>填写预览</h3>
+              <span>请检查是否有问题</span>
+            </div>
+            <div id="preview-list" class="preview-list"></div>
+            <div class="confirm-row">
+              <label class="checkline">
+                <input id="preview-confirmed" type="checkbox" />
+                <span>我已检查，内容没有问题</span>
+              </label>
+            </div>
+          </section>
+          <section id="batch-progress" class="batch-progress hidden" aria-live="polite">
+            <div class="progress-meta">
+              <strong id="batch-progress-title">批量生成中</strong>
+              <span id="batch-progress-count">0/0</span>
+            </div>
+            <div class="progress-track">
+              <div id="batch-progress-fill" class="progress-fill"></div>
+            </div>
+            <p id="batch-progress-detail">正在准备生成任务...</p>
+            <button id="cancel-batch" type="button" class="secondary mini">取消生成</button>
+          </section>
+          <div id="download-slot"></div>
+          <div id="results" class="results empty">结果会显示在这里。</div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js?v=20260531-15"></script>
+    <script src="/static/api-presets.js?v=20260531-3"></script>
+    <script src="/static/secret-toggle.js?v=20260528-1"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+name: ai-form-filler
+
+services:
+  ai-form-filler:
+    build: .
+    ports:
+      - "18080:8000"
+    environment:
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.openai.com/v1}
+      AI_MODEL: ${AI_MODEL:-gpt-4.1-mini}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD_HASH: ${DEFAULT_ADMIN_PASSWORD_HASH:-}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+      - ./config:/app/config
+    restart: unless-stopped

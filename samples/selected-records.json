@@ -1,0 +1,18 @@
+[
+  {
+    "title": "5月1日-网络系统管理基础复盘",
+    "answers": [
+      {"name": "日期", "value": "5月1日", "confidence": 0.9, "reason": "来自任务链接"},
+      {"name": "训练模块", "value": "网络系统管理基础", "confidence": 0.9, "reason": "来自任务链接"},
+      {"name": "训练任务", "value": "Linux 用户、权限、服务管理训练", "confidence": 0.9, "reason": "来自任务链接"}
+    ]
+  },
+  {
+    "title": "5月2日-Windows-Server",
+    "answers": [
+      {"name": "日期", "value": "5月2日", "confidence": 0.9, "reason": "来自任务链接"},
+      {"name": "训练模块", "value": "Windows Server", "confidence": 0.9, "reason": "来自任务链接"},
+      {"name": "训练任务", "value": "域服务与 DNS 训练", "confidence": 0.9, "reason": "来自任务链接"}
+    ]
+  }
+]
