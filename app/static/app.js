@@ -48,6 +48,8 @@ const addTeacherButton = document.querySelector("#add-teacher");
 const apiSettingsToggle = document.querySelector("#api-settings-toggle");
 const apiSettingsPanel = document.querySelector("#api-settings-panel");
 const apiSettingsClose = document.querySelector("#api-settings-close");
+const settingsCancelButton = document.querySelector("#settings-cancel");
+const settingsSaveCloseButton = document.querySelector("#settings-save-close");
 const settingsCard = document.querySelector(".settings-card");
 const quickApiSettingsDetailButton = document.querySelector("#quick-api-settings-detail");
 const quickApiTestButton = document.querySelector("#quick-api-test");
@@ -61,6 +63,7 @@ const gpuActions = document.querySelector("#gpu-actions");
 const fetchGpusButton = document.querySelector("#fetch-gpus");
 const gpuStatus = document.querySelector("#gpu-status");
 const currentApiSummary = document.querySelector("#current-api-summary");
+const quickApiTestStatus = document.querySelector("#quick-api-test-status");
 const requirePasswordInput = document.querySelector("#require-password");
 const authSettingsStatus = document.querySelector("#auth-settings-status");
 const exportAccountDataButton = document.querySelector("#export-account-data");
@@ -130,6 +133,9 @@ renderSkillsPresets();
 setCustomMode("prompt", { silent: true });
 renderModuleTeacherControls();
 apiSettingsPanel.classList.add("hidden");
+if (new URLSearchParams(window.location.search).get("settings") === "1") {
+  apiSettingsPanel.classList.remove("hidden");
+}
 setRequirementsSourceMode("text", { silent: true });
 setFillMode(true);
 updateApiSummary();
@@ -155,7 +161,12 @@ function moveGenerationSettingsToSettingsPanel() {
   const title = document.createElement("h3");
   title.textContent = "生成要求";
   section.append(title, ...controls);
-  settingsCard.append(section);
+  const footer = settingsCard.querySelector(".settings-footer");
+  if (footer) {
+    settingsCard.insertBefore(section, footer);
+  } else {
+    settingsCard.append(section);
+  }
 }
 
 function initWorkspaceResizer() {
@@ -319,6 +330,13 @@ apiSettingsToggle.addEventListener("click", () => {
 apiSettingsClose.addEventListener("click", () => {
   apiSettingsPanel.classList.add("hidden");
 });
+settingsCancelButton?.addEventListener("click", () => {
+  apiSettingsPanel.classList.add("hidden");
+});
+settingsSaveCloseButton?.addEventListener("click", () => {
+  if (window.saveCurrentApiPreset?.() === false) return;
+  apiSettingsPanel.classList.add("hidden");
+});
 apiSettingsPanel.addEventListener("click", (event) => {
   if (event.target === apiSettingsPanel) {
     apiSettingsPanel.classList.add("hidden");
@@ -327,9 +345,7 @@ apiSettingsPanel.addEventListener("click", (event) => {
 quickApiSettingsDetailButton?.addEventListener("click", () => {
   apiSettingsPanel.classList.remove("hidden");
 });
-quickApiTestButton.addEventListener("click", () => {
-  testApiButton.click();
-});
+quickApiTestButton.addEventListener("click", () => runApiTest());
 quickPreloadModelButton.addEventListener("click", () => preloadModelButton.click());
 quickRestartModelButton.addEventListener("click", () => restartModelButton.click());
 quickUnloadModelButton.addEventListener("click", () => unloadModelButton.click());
@@ -1023,7 +1039,6 @@ function setCustomMode(mode, options = {}) {
 
 function currentPlanSignature() {
   const planFile = document.querySelector("#plan-file");
-  const templateFile = document.querySelector("#file");
   return JSON.stringify({
     requirements_url: document.querySelector("#requirements-url").value.trim(),
     requirements_text: document.querySelector("#requirements-text").value.trim(),
@@ -1031,7 +1046,6 @@ function currentPlanSignature() {
     requirements_user_agent: document.querySelector("#requirements-user-agent").value.trim(),
     requirements_referer: document.querySelector("#requirements-referer").value.trim(),
     plan_file: planFile?.files?.[0] ? `${planFile.files[0].name}:${planFile.files[0].size}:${planFile.files[0].lastModified}` : "",
-    template_file: templateFile?.files?.[0] ? `${templateFile.files[0].name}:${templateFile.files[0].size}:${templateFile.files[0].lastModified}` : "",
     form_schema: document.querySelector("#form-schema").value.trim(),
     selected_modules: selectedModulesInput.value,
     module_teacher_map: moduleTeacherMapInput.value,
@@ -1270,26 +1284,38 @@ saveConfigButton.addEventListener("click", async () => {
   }
 });
 
-testApiButton.addEventListener("click", async () => {
-  testApiButton.disabled = true;
-  apiTestStatus.className = "";
+testApiButton.addEventListener("click", () => runApiTest());
+
+async function runApiTest() {
+  [testApiButton, quickApiTestButton].forEach((button) => {
+    if (button) button.disabled = true;
+  });
+  setApiTestStatus("", "");
   const isOllama = document.querySelector("#api-format").value === "ollama";
-  apiTestStatus.textContent = isOllama ? "正在检查 Ollama 和当前模型..." : "正在测试 API...";
+  setApiTestStatus("", isOllama ? "正在检查 Ollama 和当前模型..." : "正在测试 API...");
   try {
     const response = await postJsonWithRetry("/api/test-api", readApiConfig());
     const payload = await readResponse(response);
     if (!response.ok) {
       throw new Error(payload.detail || "API 测试失败");
     }
-    apiTestStatus.className = "ok-text";
-    apiTestStatus.textContent = payload.message || "API 可用";
+    setApiTestStatus("ok-text", payload.message || "API 可用");
   } catch (error) {
-    apiTestStatus.className = "error-text";
-    apiTestStatus.textContent = humanFetchError(error);
+    setApiTestStatus("error-text", humanFetchError(error));
   } finally {
-    testApiButton.disabled = false;
+    [testApiButton, quickApiTestButton].forEach((button) => {
+      if (button) button.disabled = false;
+    });
   }
-});
+}
+
+function setApiTestStatus(className, text) {
+  [apiTestStatus, quickApiTestStatus].forEach((status) => {
+    if (!status) return;
+    status.className = [status === quickApiTestStatus ? "api-summary" : "", className].filter(Boolean).join(" ");
+    status.textContent = text;
+  });
+}
 
 preloadModelButton.addEventListener("click", () => runOllamaModelAction("preload", "正在预加载 Ollama 模型，首次加载大模型可能需要一会儿..."));
 restartModelButton.addEventListener("click", () => runOllamaModelAction("restart", "正在重启 Ollama 模型..."));
@@ -1373,7 +1399,7 @@ async function loadSavedConfig() {
     const model = config.model || "";
     apiFormat.value = config.format || "openai";
     apiBaseUrl.value = config.base_url || "";
-    apiKey.value = config.format === "ollama" ? "" : config.api_key || "";
+    apiKey.value = config.api_key || "";
     gpuModelInput.value = config.gpu_model || "";
     if (model && ![...apiModel.options].some((option) => option.value === model)) {
       apiModel.append(new Option(model, model));
@@ -1420,7 +1446,7 @@ function readApiConfig() {
   return {
     format,
     base_url: document.querySelector("#api-base-url").value,
-    api_key: format === "ollama" ? "" : document.querySelector("#api-key").value,
+    api_key: document.querySelector("#api-key").value,
     model: document.querySelector("#api-model").value,
     gpu_model: format === "ollama" ? gpuModelInput.value.trim() : "",
   };
@@ -1463,7 +1489,7 @@ gpuModelInput?.addEventListener("change", updateApiSummary);
 function renderResults(payload) {
   statusPill.textContent = payload.used_ai ? "AI 已启用" : "本地兜底";
   renderPreview(payload);
-  renderDownload(payload.download_url, payload.folder_path);
+  renderDownload(payload.download_url, payload.folder_path, payload.folder_files, payload.folder_zip_url);
   results.className = "results";
   if (payload.batch && Array.isArray(payload.records)) {
     renderBatchResults(payload.records);
@@ -1502,11 +1528,11 @@ function renderResults(payload) {
 }
 
 previewConfirmed.addEventListener("change", () => {
-  const link = downloadSlot.querySelector("a");
-  if (link) {
+  const links = downloadSlot.querySelectorAll("a");
+  links.forEach((link) => {
     link.classList.toggle("disabled-link", !previewConfirmed.checked);
     link.setAttribute("aria-disabled", previewConfirmed.checked ? "false" : "true");
-  }
+  });
 });
 
 function renderPlanPicker(records) {
@@ -1681,6 +1707,15 @@ async function pollBatchJob(jobId) {
     return;
   }
   if (job.status === "failed") {
+    currentBatchJobId = "";
+    cancelBatchButton.disabled = true;
+    if (job.partial_result) {
+      lastPayload = job.partial_result;
+      renderResults(job.partial_result);
+      copyButton.disabled = false;
+      failBatchProgress(job.message || job.error || "批量生成失败，已导出已完成部分。", job.partial_result);
+      return;
+    }
     throw new Error(job.message || job.error || "批量生成失败");
   }
   if (job.status === "canceled") {
@@ -1724,12 +1759,12 @@ function finishBatchProgress(payload) {
   updateBatchProgress(100, "批量生成完成", `${total}/${total}`, payload.used_ai ? "已使用当前模型生成并写入完成。" : "已使用本地兜底生成并写入完成。");
 }
 
-function failBatchProgress(message) {
+function failBatchProgress(message, partialPayload = null) {
   window.clearTimeout(batchProgressTimer);
   currentBatchJobId = "";
   cancelBatchButton.disabled = true;
   if (batchProgressPanel.classList.contains("hidden")) return;
-  batchProgressTitle.textContent = "批量生成失败";
+  batchProgressTitle.textContent = partialPayload ? "批量生成中断" : "批量生成失败";
   batchProgressDetail.textContent = message || "生成失败，请检查任务内容和 API 配置。";
 }
 
@@ -1811,13 +1846,46 @@ function renderBatchResults(records) {
   );
 }
 
-function renderDownload(downloadUrl, folderPath = "") {
+function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZipUrl = "") {
   downloadSlot.replaceChildren();
   if (folderPath) {
     const message = document.createElement("div");
     message.className = "download-link folder-output";
     message.textContent = `文件夹已生成：${folderPath}`;
     downloadSlot.append(message);
+    const effectiveFolderZipUrl = folderZipUrl || folderZipUrlFromPath(folderPath);
+    if (effectiveFolderZipUrl) {
+      const zipLink = document.createElement("a");
+      zipLink.className = "download-link batch-download disabled-link";
+      zipLink.href = effectiveFolderZipUrl;
+      zipLink.textContent = "批量下载全部 ZIP";
+      zipLink.addEventListener("click", (event) => {
+        if (!previewConfirmed.checked) {
+          event.preventDefault();
+          alert("请先勾选“我已检查，内容没有问题”再下载。");
+        }
+      });
+      downloadSlot.append(zipLink);
+    }
+    if (Array.isArray(folderFiles) && folderFiles.length) {
+      const list = document.createElement("div");
+      list.className = "folder-file-list";
+      folderFiles.forEach((file) => {
+        if (!file?.download_url || !file?.name) return;
+        const link = document.createElement("a");
+        link.className = "download-link disabled-link";
+        link.href = file.download_url;
+        link.textContent = `下载 ${file.name}`;
+        link.addEventListener("click", (event) => {
+          if (!previewConfirmed.checked) {
+            event.preventDefault();
+            alert("请先勾选“我已检查，内容没有问题”再下载。");
+          }
+        });
+        list.append(link);
+      });
+      downloadSlot.append(list);
+    }
     return;
   }
   if (!downloadUrl) return;
@@ -1838,6 +1906,11 @@ function renderDownload(downloadUrl, folderPath = "") {
     }
   });
   downloadSlot.append(link);
+}
+
+function folderZipUrlFromPath(folderPath) {
+  const folderName = String(folderPath || "").split(/[\\/]/).filter(Boolean).pop();
+  return folderName ? `/download-folder-zip/${encodeURIComponent(folderName)}` : "";
 }
 
 function renderPreview(payload) {

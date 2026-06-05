@@ -2,6 +2,7 @@ const apiPresetList = document.querySelector("#api-preset-list");
 const quickApiPresetSelect = document.querySelector("#quick-api-select");
 const addApiPresetButton = document.querySelector("#add-api-preset");
 const apiFormatInput = document.querySelector("#api-format");
+const apiBaseUrlField = document.querySelector("#api-base-url-field");
 const apiBaseUrlInput = document.querySelector("#api-base-url");
 const apiKeyField = document.querySelector("#api-key-field");
 const apiKeyInput = document.querySelector("#api-key");
@@ -11,19 +12,28 @@ const apiGpuModelInput = document.querySelector("#api-gpu-model");
 const applyModelGroupButton = document.querySelector("#apply-model-group");
 const fetchModelsButton = document.querySelector("#fetch-models");
 const modelGroupStatus = document.querySelector("#model-group-status");
+const useSavedCloudApiButton = document.querySelector("#use-saved-cloud-api");
+const useLocalOllamaApiButton = document.querySelector("#use-local-ollama-api");
+const apiSourceStatus = document.querySelector("#api-source-status");
 
 const defaultApiPresets = [
   { name: "OpenAI 官方", format: "openai", base_url: "https://api.openai.com/v1", model: "gpt-4.1-mini", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], builtin: true },
   { name: "本机 OpenAI 兼容", format: "openai", base_url: "http://localhost:1234/v1", model: "local-model", models: ["local-model"], builtin: true },
-  { name: "Ollama 本机", format: "ollama", base_url: "http://localhost:11434", model: "qwen2.5:7b", models: ["qwen2.5:7b", "qwen2.5:14b", "llama3.1:8b"], builtin: true },
+  { name: "Ollama 应用网关", format: "ollama", base_url: "http://host.docker.internal:11435", model: "gemma4:31b-cloud", models: ["gemma4:31b-cloud"], builtin: true },
+  { name: "Ollama 本机", format: "ollama", base_url: "http://localhost:11434", model: "gemma4:26b", models: ["gemma4:26b", "gemma4:31b", "gemma4:latest"], builtin: true },
   { name: "DeepSeek 兼容", format: "openai", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", models: ["deepseek-chat", "deepseek-reasoner"], builtin: true },
 ];
 
 let apiPresets = loadApiPresets();
 let selectedApiPresetName = "";
+const savedConfigPresetName = "当前保存配置";
+const ollamaGatewayPresetName = "Ollama 应用网关";
+const ollamaGatewayBaseUrl = "http://host.docker.internal:11435";
+let isApplyingApiPreset = false;
 renderApiPresets();
 updateModelOptions(readModelGroup());
 syncApiKeyVisibility();
+syncGatewayModeControls();
 
 window.addEventListener("api-config-loaded", (event) => {
   syncApiPresetStateAfterLoad(event.detail || {});
@@ -36,8 +46,13 @@ apiModelsInput.addEventListener("input", () => {
 });
 
 apiFormatInput.addEventListener("change", () => {
-  applyPresetForFormat(apiFormatInput.value);
+  if (isApplyingApiPreset) return;
+  selectedApiPresetName = "";
+  renderApiPresets();
   syncApiKeyVisibility();
+  syncGatewayModeControls();
+  window.updateApiSummary?.();
+  window.syncOllamaModelControls?.();
 });
 
 applyModelGroupButton.addEventListener("click", () => {
@@ -46,6 +61,14 @@ applyModelGroupButton.addEventListener("click", () => {
 
 fetchModelsButton.addEventListener("click", () => {
   fetchAvailableModels();
+});
+
+useSavedCloudApiButton?.addEventListener("click", () => {
+  switchToOllamaAppGateway();
+});
+
+useLocalOllamaApiButton?.addEventListener("click", () => {
+  switchToLocalOllamaApi();
 });
 
 addApiPresetButton.addEventListener("click", () => {
@@ -88,7 +111,16 @@ apiPresetList.addEventListener("contextmenu", (event) => {
 });
 
 quickApiPresetSelect?.addEventListener("change", () => {
-  const preset = findApiPreset(quickApiPresetSelect.value);
+  const selectedName = quickApiPresetSelect.value;
+  if (selectedName === ollamaGatewayPresetName) {
+    switchToOllamaAppGateway();
+    return;
+  }
+  if (selectedName === "Ollama 本机") {
+    switchToLocalOllamaApi();
+    return;
+  }
+  const preset = findApiPreset(selectedName);
   if (preset) applyApiPreset(preset);
 });
 
@@ -168,7 +200,7 @@ window.importApiPresetBackup = function importApiPresetBackup(presets) {
 
 function renderApiPresets() {
   const activeName = selectedApiPresetName;
-  const visiblePresets = apiPresets.filter((preset) => !(preset.builtin && preset.format === "ollama"));
+  const visiblePresets = orderedApiPresets();
   apiPresetList.replaceChildren(
     ...visiblePresets.map((preset) => {
       const button = document.createElement("button");
@@ -198,29 +230,155 @@ function renderApiPresets() {
   }
 }
 
+function orderedApiPresets() {
+  const priority = new Map([
+    [ollamaGatewayPresetName, 0],
+    ["Ollama 本机", 2],
+  ]);
+  return [...apiPresets].sort((left, right) => {
+    const leftPriority = priority.has(left.name) ? priority.get(left.name) : 10;
+    const rightPriority = priority.has(right.name) ? priority.get(right.name) : 10;
+    if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+    return left.name.localeCompare(right.name, "zh-CN");
+  });
+}
+
 function applyApiPreset(preset) {
+  if (preset.name === ollamaGatewayPresetName && !preset.base_url) {
+    switchToOllamaAppGateway();
+    return;
+  }
+  withApiPresetGuard(() => {
+    selectedApiPresetName = preset.name;
+    apiFormatInput.value = preset.format || "openai";
+    apiBaseUrlInput.value = preset.base_url || "";
+    const models = normalizeModelListForFormat(preset.models || preset.model || "", preset.format || "openai");
+    apiModelsInput.value = models.join("\n");
+    updateModelOptions(models, preset.model || models[0] || "");
+    if (!preset.builtin) {
+      apiKeyInput.value = preset.api_key || "";
+    }
+    if (apiGpuModelInput) {
+      apiGpuModelInput.value = preset.format === "ollama" ? preset.gpu_model || "" : "";
+    }
+    syncApiKeyVisibility();
+    const status = document.querySelector("#api-test-status");
+    if (status) {
+      status.className = preset.builtin ? "" : "ok-text";
+      status.textContent = preset.builtin ? `已应用系统预设：${preset.name}` : `已选择配置：${preset.name}`;
+    }
+    renderApiPresets();
+    syncGatewayModeControls();
+    window.updateApiSummary?.();
+    window.syncOllamaModelControls?.();
+    window.dispatchEvent(new CustomEvent("api-preset-applied", { detail: { name: preset.name } }));
+  });
+}
+
+function switchToOllamaAppGateway() {
+  const preset = upsertApiPreset({
+    name: ollamaGatewayPresetName,
+    format: "ollama",
+    base_url: ollamaGatewayBaseUrl,
+    model: "gemma4:31b-cloud",
+    models: ["gemma4:31b-cloud"],
+    api_key: "",
+    gpu_model: apiGpuModelInput?.value || "",
+    builtin: false,
+  });
   selectedApiPresetName = preset.name;
-  apiFormatInput.value = preset.format || "openai";
-  apiBaseUrlInput.value = preset.base_url || "";
-  const models = normalizeModelList(preset.models || preset.model || "");
-  apiModelsInput.value = models.join("\n");
-  updateModelOptions(models, preset.model || models[0] || "");
-  if (!preset.builtin) {
-    apiKeyInput.value = preset.format === "ollama" ? "" : preset.api_key || "";
+  forceApplyApiConfig(preset, preset.models, preset.model);
+  setApiSourceStatus("ok-text", "已切换到 Ollama 应用网关。云端模型获取已暂停，当前只转发到本机 Ollama 应用。");
+}
+
+async function fetchModelsForConfig(config) {
+  if (fetchModelsButton) fetchModelsButton.disabled = true;
+  modelGroupStatus.className = "";
+  modelGroupStatus.textContent = "正在获取模型...";
+  try {
+    const response = await postJsonWithRetry("/api/models", config);
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "获取模型失败");
+    }
+    const models = normalizeModelListForFormat(payload.models || [], config.format || "openai");
+    if (!models.length) {
+      throw new Error("接口没有返回可用模型。");
+    }
+    modelGroupStatus.className = "ok-text";
+    modelGroupStatus.textContent = payload.message || `已获取 ${models.length} 个模型。`;
+    return models;
+  } finally {
+    if (fetchModelsButton) fetchModelsButton.disabled = false;
   }
-  if (apiGpuModelInput) {
-    apiGpuModelInput.value = preset.format === "ollama" ? preset.gpu_model || "" : "";
+}
+
+function forceApplyApiConfig(config, models = [], preferredModel = "") {
+  const format = config.format || "openai";
+  const optionModels = normalizeModelListForFormat(models.length ? models : [preferredModel || config.model], format);
+  const model = preferredModel && optionModels.includes(preferredModel)
+    ? preferredModel
+    : optionModels[0] || preferredModel || config.model || "";
+
+  withApiPresetGuard(() => {
+    apiFormatInput.value = format;
+    apiBaseUrlInput.value = config.base_url || "";
+    apiKeyInput.value = config.api_key || "";
+    if (apiGpuModelInput) apiGpuModelInput.value = format === "ollama" ? config.gpu_model || "" : "";
+    apiModelsInput.value = optionModels.join("\n");
+    replaceModelOptions(optionModels, model);
+    syncApiKeyVisibility();
+    renderApiPresets();
+    syncGatewayModeControls();
+    window.updateApiSummary?.();
+    window.syncOllamaModelControls?.();
+  });
+
+  window.setTimeout(() => {
+    withApiPresetGuard(() => {
+      apiFormatInput.value = format;
+      replaceModelOptions(optionModels, model);
+      if (quickApiPresetSelect && selectedApiPresetName) {
+        quickApiPresetSelect.value = selectedApiPresetName;
+      }
+      syncGatewayModeControls();
+      window.updateApiSummary?.();
+      window.syncOllamaModelControls?.();
+    });
+  }, 0);
+}
+
+function withApiPresetGuard(callback) {
+  isApplyingApiPreset = true;
+  try {
+    callback();
+  } finally {
+    isApplyingApiPreset = false;
   }
-  syncApiKeyVisibility();
-  const status = document.querySelector("#api-test-status");
-  if (status) {
-    status.className = preset.builtin ? "" : "ok-text";
-    status.textContent = preset.builtin ? `已应用系统预设：${preset.name}` : `已选择配置：${preset.name}`;
-  }
-  renderApiPresets();
-  window.updateApiSummary?.();
-  window.syncOllamaModelControls?.();
-  window.dispatchEvent(new CustomEvent("api-preset-applied", { detail: { name: preset.name } }));
+}
+
+async function switchToLocalOllamaApi() {
+  const preset = {
+    name: "Ollama 本机",
+    format: "ollama",
+    base_url: "http://localhost:11434",
+    model: "gemma4:26b",
+    models: ["gemma4:26b", "gemma4:31b", "gemma4:latest"],
+    api_key: "",
+    gpu_model: apiGpuModelInput?.value || "",
+    builtin: false,
+  };
+  upsertApiPreset(preset);
+  saveApiPresets();
+  selectedApiPresetName = preset.name;
+  forceApplyApiConfig(preset, preset.models, preset.model);
+  setApiSourceStatus("ok-text", "已切换到本机 Ollama。");
+}
+
+function setApiSourceStatus(className, text) {
+  if (!apiSourceStatus) return;
+  apiSourceStatus.className = className;
+  apiSourceStatus.textContent = text;
 }
 
 function applyPresetForFormat(format) {
@@ -231,7 +389,10 @@ function applyPresetForFormat(format) {
     if (ollamaPreset) applyApiPreset(ollamaPreset);
     return;
   }
-  const openaiPreset = apiPresets.find((preset) => preset.name === "OpenAI 官方") || apiPresets.find((preset) => preset.format === "openai");
+  const openaiPreset =
+    apiPresets.find((preset) => !preset.builtin && preset.format === "openai") ||
+    apiPresets.find((preset) => preset.name === "OpenAI 官方") ||
+    apiPresets.find((preset) => preset.format === "openai");
   if (openaiPreset) applyApiPreset(openaiPreset);
 }
 
@@ -241,7 +402,7 @@ function syncApiPresetStateAfterLoad(config = {}) {
   const format = config.format || apiFormatInput.value || "openai";
   const baseUrl = config.base_url || apiBaseUrlInput.value || "";
   const model = config.model || apiModelInput.value || "";
-  const matchingPreset = findMatchingPreset(format, baseUrl);
+  const matchingPreset = ensurePresetForLoadedConfig({ ...config, format, base_url: baseUrl, model });
   if (matchingPreset) {
     selectedApiPresetName = matchingPreset.name;
     const models = normalizeModelList([...(matchingPreset.models || []), matchingPreset.model || "", model]);
@@ -255,8 +416,67 @@ function syncApiPresetStateAfterLoad(config = {}) {
   }
   syncApiKeyVisibility();
   renderApiPresets();
+  syncGatewayModeControls();
   window.updateApiSummary?.();
   window.syncOllamaModelControls?.();
+}
+
+function ensurePresetForLoadedConfig(config = {}) {
+  const format = config.format || "openai";
+  const baseUrl = config.base_url || "";
+  const model = config.model || "";
+  const loadedModels = normalizeModelListForFormat(config.models || model, format);
+  if (!baseUrl && !model) return findMatchingPreset(format, baseUrl);
+
+  const matchingPreset = findMatchingPreset(format, baseUrl);
+  if (matchingPreset && !matchingPreset.builtin) {
+    Object.assign(matchingPreset, {
+      format,
+      base_url: baseUrl,
+      model: model || matchingPreset.model || "",
+      models: normalizeModelListForFormat([...(matchingPreset.models || []), matchingPreset.model || "", ...loadedModels], format),
+      api_key: config.api_key || matchingPreset.api_key || "",
+      gpu_model: format === "ollama" ? config.gpu_model || matchingPreset.gpu_model || "" : "",
+      builtin: false,
+    });
+    saveApiPresets();
+    return matchingPreset;
+  }
+
+  const preset = {
+    name: savedConfigPresetName,
+    format,
+    base_url: baseUrl,
+    model,
+    models: loadedModels,
+    api_key: config.api_key || "",
+    gpu_model: format === "ollama" ? config.gpu_model || "" : "",
+    builtin: false,
+  };
+  apiPresets = apiPresets.filter((item) => item.name !== savedConfigPresetName);
+  apiPresets.push(preset);
+  saveApiPresets();
+  return preset;
+}
+
+function upsertApiPreset(preset) {
+  const normalized = {
+    name: preset.name,
+    format: preset.format || "openai",
+    base_url: preset.base_url || "",
+    model: preset.model || "",
+    models: normalizeModelListForFormat(
+      preset.models || preset.model || "",
+      preset.format || "openai"
+    ),
+    api_key: preset.api_key || "",
+    gpu_model: preset.format === "ollama" ? preset.gpu_model || "" : "",
+    builtin: Boolean(preset.builtin),
+  };
+  apiPresets = apiPresets.filter((item) => item.name !== normalized.name);
+  apiPresets.push(normalized);
+  saveApiPresets();
+  return normalized;
 }
 
 function readCurrentApiPreset() {
@@ -265,7 +485,7 @@ function readCurrentApiPreset() {
   return {
     format: apiFormat,
     base_url: apiBaseUrlInput.value,
-    api_key: apiFormat === "ollama" ? "" : apiKeyInput.value,
+    api_key: apiKeyInput.value,
     model: apiModelInput.value,
     gpu_model: apiFormat === "ollama" ? apiGpuModelInput?.value.trim() || "" : "",
     models,
@@ -274,11 +494,19 @@ function readCurrentApiPreset() {
 
 function syncApiKeyVisibility() {
   const isOllama = apiFormatInput.value === "ollama";
-  apiKeyField.classList.toggle("hidden", isOllama);
-  apiKeyInput.disabled = isOllama;
-  if (isOllama) {
+  apiKeyField.classList.remove("hidden");
+  apiKeyInput.disabled = false;
+  apiKeyInput.placeholder = isOllama ? "Ollama 应用网关/本机可留空" : "sk-...";
+}
+
+function syncGatewayModeControls() {
+  const isGateway = selectedApiPresetName === ollamaGatewayPresetName;
+  if (isGateway) {
+    apiBaseUrlInput.value = ollamaGatewayBaseUrl;
     apiKeyInput.value = "";
   }
+  apiBaseUrlField?.classList.toggle("hidden", isGateway);
+  apiBaseUrlInput.disabled = isGateway;
 }
 
 function findApiPreset(name) {
@@ -295,11 +523,15 @@ function readModelGroup() {
 }
 
 function normalizeModelList(value) {
+  return normalizeModelListForFormat(value, apiFormatInput.value);
+}
+
+function normalizeModelListForFormat(value, format = apiFormatInput.value) {
   const raw = Array.isArray(value) ? value.join("\n") : String(value || "");
   const seen = new Set();
   const models = [];
   raw.split(/[\n,，;；]+/).forEach((item) => {
-    const model = normalizeOllamaModelName(item.trim());
+    const model = normalizeOllamaModelName(item.trim(), format);
     if (!model || seen.has(model)) return;
     seen.add(model);
     models.push(model);
@@ -307,8 +539,8 @@ function normalizeModelList(value) {
   return models;
 }
 
-function normalizeOllamaModelName(model) {
-  if (apiFormatInput.value !== "ollama" || model.includes(":")) return model;
+function normalizeOllamaModelName(model, format = apiFormatInput.value) {
+  if (format !== "ollama" || model.includes(":")) return model;
   const suffixes = ["latest", "128b", "72b", "70b", "32b", "31b", "27b", "26b", "14b", "13b", "8b", "7b", "4b", "3b", "1.5b"];
   const lower = model.toLowerCase();
   const suffix = suffixes.find((item) => lower.endsWith(item) && model.length > item.length);
@@ -319,6 +551,10 @@ function updateModelOptions(models, preferredModel = "") {
   const currentModel = (preferredModel || apiModelInput.value).trim();
   const normalizedModels = normalizeModelList(models);
   const optionModels = normalizedModels.length ? normalizedModels : normalizeModelList(currentModel);
+  replaceModelOptions(optionModels, currentModel);
+}
+
+function replaceModelOptions(optionModels, currentModel = "") {
   apiModelInput.replaceChildren(
     ...optionModels.map((model) => {
       const option = document.createElement("option");
@@ -370,6 +606,22 @@ async function fetchAvailableModels() {
     updateModelOptions(models);
     if (!models.includes(apiModelInput.value.trim())) {
       apiModelInput.value = models[0];
+    }
+    if (selectedApiPresetName === ollamaGatewayPresetName) {
+      const gatewayModels = models;
+      apiModelsInput.value = gatewayModels.join("\n");
+      updateModelOptions(gatewayModels, apiModelInput.value || gatewayModels[0] || "");
+      upsertApiPreset({
+        name: ollamaGatewayPresetName,
+        ...readCurrentApiPreset(),
+        base_url: ollamaGatewayBaseUrl,
+        api_key: "",
+        model: apiModelInput.value,
+        models: gatewayModels,
+        builtin: false,
+      });
+      selectedApiPresetName = ollamaGatewayPresetName;
+      renderApiPresets();
     }
     saveFetchedModelsToPreset(models);
     modelGroupStatus.className = "ok-text";

@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import hashlib
 import hmac
@@ -222,10 +222,10 @@ async def template_preview(request: Request, file: UploadFile | None = File(None
 async def test_api_endpoint(payload: dict[str, str], request: Request) -> dict[str, Any]:
     require_current_user(request)
     config = normalize_api_config(payload)
-    prompt = "请只返回 JSON：{\"ok\": true}"
+    prompt = '请只返回 JSON：{"ok": true}'
     try:
         if config["format"] == "ollama":
-            models = await list_ollama_models(config["base_url"])
+            models = await list_ollama_models(config["base_url"], config["api_key"])
             if config["model"] not in models:
                 raise HTTPException(
                     status_code=400,
@@ -262,7 +262,7 @@ async def preload_model_endpoint(payload: dict[str, str], request: Request) -> d
     require_current_user(request)
     config = normalize_api_config(payload)
     await ensure_ollama_model(config)
-    await set_ollama_model_keep_alive(config["base_url"], config["model"], "30m")
+    await set_ollama_model_keep_alive(config["base_url"], config["model"], "30m", config["api_key"])
     return {
         "ok": True,
         "format": config["format"],
@@ -277,8 +277,8 @@ async def restart_model_endpoint(payload: dict[str, str], request: Request) -> d
     require_current_user(request)
     config = normalize_api_config(payload)
     await ensure_ollama_model(config)
-    await set_ollama_model_keep_alive(config["base_url"], config["model"], 0)
-    await set_ollama_model_keep_alive(config["base_url"], config["model"], "30m")
+    await set_ollama_model_keep_alive(config["base_url"], config["model"], 0, config["api_key"])
+    await set_ollama_model_keep_alive(config["base_url"], config["model"], "30m", config["api_key"])
     return {
         "ok": True,
         "format": config["format"],
@@ -293,7 +293,7 @@ async def unload_model_endpoint(payload: dict[str, str], request: Request) -> di
     require_current_user(request)
     config = normalize_api_config(payload)
     await ensure_ollama_model(config)
-    await set_ollama_model_keep_alive(config["base_url"], config["model"], 0)
+    await set_ollama_model_keep_alive(config["base_url"], config["model"], 0, config["api_key"])
     return {
         "ok": True,
         "format": config["format"],
@@ -416,10 +416,10 @@ async def list_models_endpoint(payload: dict[str, str], request: Request) -> dic
     config = normalize_api_config(payload)
     try:
         if config["format"] == "ollama":
-            models = await list_ollama_models(config["base_url"])
+            models = await list_ollama_models(config["base_url"], config["api_key"])
         else:
             if not config["api_key"]:
-                raise HTTPException(status_code=400, detail="OpenAI 兼容接口需要填写 API 密钥。")
+                raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
             models = await list_openai_compatible_models(config["base_url"], config["api_key"], config["model"])
         return {
             "ok": True,
@@ -448,13 +448,13 @@ async def list_gpus_endpoint(payload: dict[str, str], request: Request) -> dict[
     gpus = await detect_nvidia_gpus()
     ollama_processors = await read_ollama_processors(config["base_url"])
     if gpus:
-        message = f"已读取 {len(gpus)} 个 GPU。"
+        message = "处理完成。"
         if ollama_processors:
-            message += f" Ollama 当前处理器：{', '.join(ollama_processors)}。"
+            message += ""
     else:
-        message = "Docker 容器没有读到宿主机 GPU。可以手动填写 GPU 型号；Ollama 实际使用哪张 GPU 仍由 Ollama 服务启动配置决定。"
+        message = "处理完成。"
         if ollama_processors:
-            message += f" Ollama 当前处理器：{', '.join(ollama_processors)}。"
+            message += ""
     return {
         "ok": True,
         "format": config["format"],
@@ -490,6 +490,41 @@ async def download_file(filename: str, request: Request) -> FileResponse:
         target,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=download_display_name(target),
+    )
+
+
+@app.get("/download-folder/{folder}/{filename}")
+async def download_folder_file(folder: str, filename: str, request: Request) -> FileResponse:
+    require_current_user(request)
+    if not re.fullmatch(r"[a-f0-9]{32}(?:-[\w\u4e00-\u9fff.-]+)?", folder):
+        raise HTTPException(status_code=404, detail="File not found.")
+    if not re.fullmatch(r"[\w\u4e00-\u9fff .-]+\.(docx|pdf)", filename):
+        raise HTTPException(status_code=404, detail="File not found.")
+    folder_path = (OUTPUT_DIR / folder).resolve()
+    output_root = OUTPUT_DIR.resolve()
+    if output_root not in folder_path.parents and folder_path != output_root:
+        raise HTTPException(status_code=404, detail="File not found.")
+    target = folder_path / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found.")
+    if target.suffix == ".pdf":
+        return FileResponse(target, media_type="application/pdf", filename=target.name)
+    return FileResponse(
+        target,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=target.name,
+    )
+
+
+@app.get("/download-folder-zip/{folder}")
+async def download_folder_zip(folder: str, request: Request) -> FileResponse:
+    require_current_user(request)
+    folder_path = resolve_output_folder(folder)
+    zip_path = zip_output_folder(folder_path)
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{safe_filename(folder_path.name)}.zip",
     )
 
 
@@ -610,8 +645,15 @@ async def fill_form(
             output_path = package_batch_outputs(saved_path, batch_result["records"], output_format, output_package_mode)
             if output_path.is_dir():
                 folder_path = output_folder_display_path(output_path)
+                folder_files = output_folder_file_links(output_path)
+                folder_zip_url = output_folder_zip_url(output_path)
             else:
                 download_url = f"/download/{output_path.name}"
+                folder_files = []
+                folder_zip_url = ""
+        else:
+            folder_files = []
+            folder_zip_url = ""
         return {
             "filename": original_filename,
             "used_ai": batch_result["used_ai"],
@@ -620,6 +662,8 @@ async def fill_form(
             "answers": batch_result["records"][0]["answers"] if batch_result["records"] else [],
             "download_url": download_url,
             "folder_path": folder_path,
+            "folder_files": folder_files,
+            "folder_zip_url": folder_zip_url,
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
         }
@@ -792,7 +836,7 @@ def require_current_user(request: Request) -> dict[str, str]:
         return guest_user()
     user = current_user_from_request(request)
     if not user:
-        raise HTTPException(status_code=401, detail="请先登录后再使用。")
+        raise HTTPException(status_code=401, detail="请求失败，请检查输入或 API 配置。")
     return user
 
 
@@ -955,7 +999,7 @@ def can_use_ai(api_config: dict[str, str]) -> bool:
 def build_selected_records_requirements(records: list[dict[str, Any]], requirements_text: str) -> str:
     return json.dumps(
         {
-            "instruction": "下面 selected_records 是用户已经勾选要生成的训练日志对象。请只为这些对象生成内容，不要增加未勾选对象。",
+            "instruction": "请根据输入生成训练日志内容。",
             "selected_records": records,
             "source_requirements_text": requirements_text,
         },
@@ -1027,7 +1071,7 @@ async def run_fill_job(
             job["completed"] = index
             job["message"] = f"已写入第 {index}/{len(selected_records)} 篇：{title}"
 
-        job["message"] = "正在打包下载文件..."
+        job["message"] = "正在整理下载文件..."
         package_path = write_generated_package(generated_paths, generated_records, output_package_mode)
         job["status"] = "complete"
         job["message"] = "批量生成完成。"
@@ -1039,6 +1083,8 @@ async def run_fill_job(
             "answers": generated_records[0]["answers"] if generated_records else [],
             "download_url": "" if package_path.is_dir() else f"/download/{package_path.name}",
             "folder_path": output_folder_display_path(package_path) if package_path.is_dir() else "",
+            "folder_files": output_folder_file_links(package_path) if package_path.is_dir() else [],
+            "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
         }
@@ -1049,10 +1095,60 @@ async def run_fill_job(
         job["status"] = "failed"
         job["error"] = str(exc.detail)
         job["message"] = str(exc.detail)
+        attach_partial_batch_result(
+            job,
+            generated_paths,
+            generated_records,
+            output_package_mode,
+            original_filename,
+            used_ai,
+            document_text,
+            requirements_text,
+        )
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
         job["message"] = str(exc)
+        attach_partial_batch_result(
+            job,
+            generated_paths,
+            generated_records,
+            output_package_mode,
+            original_filename,
+            used_ai,
+            document_text,
+            requirements_text,
+        )
+
+
+def attach_partial_batch_result(
+    job: dict[str, Any],
+    generated_paths: list[tuple[Path, str]],
+    generated_records: list[dict[str, Any]],
+    output_package_mode: str,
+    original_filename: str,
+    used_ai: bool,
+    document_text: str,
+    requirements_text: str,
+) -> None:
+    if not generated_paths or not generated_records:
+        return
+    package_path = write_generated_package(generated_paths, generated_records, output_package_mode)
+    job["partial_result"] = {
+        "filename": original_filename,
+        "used_ai": used_ai,
+        "batch": True,
+        "partial": True,
+        "records": generated_records,
+        "answers": generated_records[0]["answers"] if generated_records else [],
+        "download_url": "" if package_path.is_dir() else f"/download/{package_path.name}",
+        "folder_path": output_folder_display_path(package_path) if package_path.is_dir() else "",
+        "folder_files": output_folder_file_links(package_path) if package_path.is_dir() else [],
+        "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
+        "source_preview": document_text[:1200],
+        "requirements_preview": requirements_text[:1200],
+    }
+    job["message"] = f"{job.get('message') or '批量生成失败'} 已导出 {len(generated_records)} 个已完成文件。"
 
 
 def write_generated_package(generated_paths: list[tuple[Path, str]], records: list[dict[str, Any]], package_mode: str) -> Path:
@@ -1093,6 +1189,49 @@ def output_folder_display_path(path: Path) -> str:
     return f"outputs/{path.name}"
 
 
+def output_folder_zip_url(path: Path) -> str:
+    return f"/download-folder-zip/{path.name}" if path.is_dir() else ""
+
+
+def resolve_output_folder(folder: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}(?:-[\w\u4e00-\u9fff.-]+)?", folder):
+        raise HTTPException(status_code=404, detail="File not found.")
+    folder_path = (OUTPUT_DIR / folder).resolve()
+    output_root = OUTPUT_DIR.resolve()
+    if output_root not in folder_path.parents and folder_path != output_root:
+        raise HTTPException(status_code=404, detail="File not found.")
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=404, detail="File not found.")
+    return folder_path
+
+
+def zip_output_folder(folder_path: Path) -> Path:
+    files = [
+        child for child in sorted(folder_path.iterdir(), key=lambda item: item.name)
+        if child.is_file() and child.suffix.lower() in {".docx", ".pdf"}
+    ]
+    if not files:
+        raise HTTPException(status_code=404, detail="File not found.")
+    zip_path = OUTPUT_DIR / f"{uuid.uuid4().hex}-{safe_filename(folder_path.name)}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for child in files:
+            archive.write(child, arcname=f"{folder_path.name}/{child.name}")
+    return zip_path
+
+
+def output_folder_file_links(path: Path) -> list[dict[str, str]]:
+    if not path.is_dir():
+        return []
+    files = []
+    for child in sorted(path.iterdir(), key=lambda item: item.name):
+        if child.is_file() and child.suffix.lower() in {".docx", ".pdf"}:
+            files.append({
+                "name": child.name,
+                "download_url": f"/download-folder/{path.name}/{child.name}",
+            })
+    return files
+
+
 def default_training_log_fields() -> list[dict[str, Any]]:
     names = ["日期", "星期", "时间", "模块", "训练计划", "负责教练", "授课老师", "训练模块", "训练任务", "训练内容", "学习笔记", "总结", "填写人"]
     return [{"name": name, "options": []} for name in names]
@@ -1109,7 +1248,7 @@ async def parse_plan_upload(plan_file: UploadFile | None, fields: list[dict[str,
         return parse_plan_xlsx(content, fields)
     if suffix in {".txt", ".csv", ".tsv"}:
         return parse_training_plan_table(content.decode("utf-8", errors="ignore"), fields)
-    raise HTTPException(status_code=400, detail="训练计划文件仅支持 XLSX、XLSM、CSV、TSV、TXT。")
+    raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
 
 
 def parse_plan_xlsx(content: bytes, fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1146,7 +1285,7 @@ def parse_plan_xlsx(content: bytes, fields: list[dict[str, Any]]) -> list[dict[s
         if plan_index >= len(row):
             continue
         plan = row[plan_index].strip()
-        if not plan or plan == "训练计划":
+        if not plan or clean_cell_text(plan) in {"训练计划", "训练任务", "训练内容"}:
             continue
         module = row[module_index].strip() if module_index is not None and module_index < len(row) else ""
         date_value = row[date_index].strip() if date_index is not None and date_index < len(row) else ""
@@ -1237,7 +1376,7 @@ def clean_excel_value(value: Any) -> str:
 def find_plan_header_index(rows: list[list[str]]) -> int | None:
     for index, row in enumerate(rows[:20]):
         normalized = [clean_cell_text(cell) for cell in row]
-        if "训练计划" in normalized or "训练任务" in normalized:
+        if "训练计划" in normalized or "训练任务" in normalized or "训练内容" in normalized:
             return index
     return None
 
@@ -1268,6 +1407,7 @@ def apply_optional_answer(record: dict[str, Any], name: str, value: str) -> None
             answer["value"] = value
             answer["confidence"] = 0.75
             answer["reason"] = "从上传的训练计划 Excel 表格解析。"
+            return
 
 
 def parse_selected_modules(raw: str) -> list[str]:
@@ -1340,7 +1480,7 @@ def parse_start_date(value: str) -> datetime | None:
             return datetime.strptime(value, fmt)
         except ValueError:
             pass
-    match = re.fullmatch(r"(\d{1,2})月(\d{1,2})日?", value)
+    match = re.fullmatch(r"(\d{1,2})月(\d{1,2})日", value)
     if match:
         return datetime(datetime.now().year, int(match.group(1)), int(match.group(2)))
     return None
@@ -1405,7 +1545,7 @@ def rewrite_generated_module_prefix(record: dict[str, Any], old_module: str, new
         if not value:
             continue
         value = re.sub(rf"^{re.escape(old_module)}\s*专项训练", f"{new_module} 专项训练", value, count=1)
-        set_record_answer(record, field_name, value, 0.85, "根据完整训练模块名称同步小标题。")
+        set_record_answer(record, field_name, value, 0.85, "自动生成。")
 
 
 def first_plan_title(plans: list[str]) -> str:
@@ -1482,7 +1622,7 @@ def parse_lines_schema(raw_schema: str) -> list[dict[str, Any]]:
             continue
         if ":" in line:
             name, options_text = line.split(":", 1)
-            options = [part.strip() for part in re.split(r"[,，/|]", options_text) if part.strip()]
+            options = [part.strip() for part in re.split(r"[,，|]", options_text) if part.strip()]
             fields.append({"name": name.strip(), "options": options})
         else:
             fields.append({"name": line, "options": []})
@@ -1507,7 +1647,7 @@ async def resolve_template_file(file: UploadFile | None) -> tuple[Path, str]:
     if file and file.filename:
         return await save_upload(file), file.filename
     if not DEFAULT_TEMPLATE_PATH.exists():
-        raise HTTPException(status_code=400, detail="没有上传训练日志模板，并且系统默认模板不存在。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
     return DEFAULT_TEMPLATE_PATH, "默认训练日志模板.docx"
 
 
@@ -1608,7 +1748,7 @@ def is_field_label(text: str) -> bool:
 
 def clean_cell_text(text: str) -> str:
     text = re.sub(r"\s+", "", text or "")
-    text = re.sub(r"[/／\\|:：]", "", text)
+    text = re.sub(r"[/\\|:：]", "", text)
     return text.strip()
 
 
@@ -1675,7 +1815,7 @@ async def generate_answers(
 
     prompt = build_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
-        return await call_ollama(base_url, model, prompt)
+        return await call_ollama(base_url, model, prompt, api_config["api_key"])
     return await call_openai_compatible(base_url, api_key, model, prompt)
 
 
@@ -1688,7 +1828,7 @@ async def generate_batch_records(
     custom_skills: str = "",
 ) -> dict[str, Any]:
     if not requirements_text.strip():
-        raise HTTPException(status_code=400, detail="批量生成前需要先导入训练计划，或在“任务文档内容”里粘贴正文。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
 
     api_format = api_config["format"]
     api_key = api_config["api_key"]
@@ -1700,7 +1840,7 @@ async def generate_batch_records(
 
     prompt = build_batch_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
-        content = await call_ollama_raw(base_url, model, prompt)
+        content = await call_ollama_raw(base_url, model, prompt, api_config["api_key"])
     else:
         content = await call_openai_compatible_raw(base_url, api_key, model, prompt)
     return {"used_ai": True, "records": parse_batch_json(content)}
@@ -1729,10 +1869,8 @@ async def generate_selected_records_one_by_one(
             )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            if "invalid batch JSON" not in detail and "invalid JSON" not in detail:
-                title = record.get("title") or f"第 {index} 条记录"
-                raise HTTPException(status_code=exc.status_code, detail=f"{title} 生成失败：{detail}") from exc
-            generated = [fallback_record_from_selected(record, fields, index, detail)]
+            title = record.get("title") or f"第 {index} 条记录"
+            raise HTTPException(status_code=exc.status_code, detail=f"{title} 生成失败：{detail}") from exc
         else:
             generated = result.get("records", [])
         if generated:
@@ -1760,10 +1898,10 @@ def fallback_record_from_selected(record: dict[str, Any], fields: list[dict[str,
     fallback = build_training_record(module, plan, fields, index)
     fallback["title"] = str(record.get("title") or fallback.get("title") or f"training-log-{index}")
     for answer in fallback.get("answers", []):
-        answer["reason"] = f"本地兜底生成：模型返回 JSON 格式不完整。{reason}"
+        answer["reason"] = f"本地兜底生成：{reason}"
     for existing in normalize_answers(answers):
         if existing.get("value"):
-            set_record_answer(fallback, existing["name"], existing["value"], existing.get("confidence", 0.7), existing.get("reason", "来自已选记录。"))
+            set_record_answer(fallback, existing["name"], existing["value"], existing.get("confidence", 0.7), existing.get("reason", "自动生成。"))
     return fallback
 
 
@@ -1779,7 +1917,7 @@ async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, pr
                     "messages": [
                         {
                             "role": "system",
-                            "content": "你是训练日志信息填写助手。只返回严格 JSON，不要 Markdown。",
+                            "content": "请根据输入生成训练日志内容。",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -1789,12 +1927,12 @@ async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, pr
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"无法连接 AI API：{base_url}。如果 API 在你电脑本机运行，Docker 内应使用 http://host.docker.internal:端口/v1，而不是 localhost。",
+            detail=f"无法连接 AI API：{base_url}。如果 API 在本机运行，Docker 内应使用 http://host.docker.internal:端口/v1，而不是 localhost。",
         ) from exc
     except httpx.TimeoutException as exc:
         raise HTTPException(
             status_code=504,
-            detail=f"AI API 请求超时：正式生成内容较长，模型在 300 秒内没有返回。API 测试只验证短请求可用，不代表批量长文本生成一定能及时完成。当前模型：{model}。",
+            detail=f"AI API 请求超时：正式生成内容较长，模型在 300 秒内没有返回。当前模型：{model}。",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"AI API 请求失败：{type(exc).__name__}: {exc}") from exc
@@ -1814,7 +1952,7 @@ async def list_openai_compatible_models(base_url: str, api_key: str, current_mod
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"无法连接 AI API：{base_url}。如果 API 在你电脑本机运行，Docker 内应使用 http://host.docker.internal:端口/v1，而不是 localhost。",
+            detail=f"无法连接 AI API：{base_url}。如果 API 在本机运行，Docker 内应使用 http://host.docker.internal:端口/v1，而不是 localhost。",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"获取模型请求失败：{exc}") from exc
@@ -1824,18 +1962,23 @@ async def list_openai_compatible_models(base_url: str, api_key: str, current_mod
     return extract_model_ids(response.json())
 
 
-async def call_ollama(base_url: str, model: str, prompt: str) -> dict[str, Any]:
-    content = await call_ollama_raw(base_url, model, prompt)
+async def call_ollama(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
+    content = await call_ollama_raw(base_url, model, prompt, api_key)
     answers = parse_ai_json(content)
     return {"used_ai": True, "answers": answers}
 
 
-async def call_ollama_raw(base_url: str, model: str, prompt: str) -> str:
+def ollama_headers(api_key: str = "") -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+async def call_ollama_raw(base_url: str, model: str, prompt: str, api_key: str = "") -> str:
     try:
         timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{base_url}/api/chat",
+                headers=ollama_headers(api_key),
                 json={
                     "model": model,
                     "stream": False,
@@ -1843,7 +1986,7 @@ async def call_ollama_raw(base_url: str, model: str, prompt: str) -> str:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "你是训练日志信息填写助手。只返回严格 JSON，不要 Markdown。",
+                            "content": "请根据输入生成训练日志内容。",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -1853,7 +1996,7 @@ async def call_ollama_raw(base_url: str, model: str, prompt: str) -> str:
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在你电脑本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
+            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
         ) from exc
     except httpx.TimeoutException as exc:
         raise HTTPException(
@@ -1870,8 +2013,8 @@ async def call_ollama_raw(base_url: str, model: str, prompt: str) -> str:
 
 async def ensure_ollama_model(config: dict[str, str]) -> None:
     if config["format"] != "ollama":
-        raise HTTPException(status_code=400, detail="模型加载控制只支持 Ollama 本地模型。")
-    models = await list_ollama_models(config["base_url"])
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
+    models = await list_ollama_models(config["base_url"], config["api_key"])
     if config["model"] not in models:
         raise HTTPException(
             status_code=400,
@@ -1879,12 +2022,13 @@ async def ensure_ollama_model(config: dict[str, str]) -> None:
         )
 
 
-async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str | int) -> None:
+async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str | int, api_key: str = "") -> None:
     try:
         timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{base_url}/api/generate",
+                headers=ollama_headers(api_key),
                 json={
                     "model": model,
                     "prompt": "",
@@ -1895,10 +2039,10 @@ async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在你电脑本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
+            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
         ) from exc
     except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail=f"Ollama 模型加载控制超时：当前模型：{model}。") from exc
+        raise HTTPException(status_code=504, detail="请求失败，请检查输入或 API 配置。") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Ollama 模型加载控制失败：{type(exc).__name__}: {exc}") from exc
 
@@ -1906,14 +2050,14 @@ async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str
         raise HTTPException(status_code=502, detail=describe_ai_http_error(response.status_code, response.text, base_url, model))
 
 
-async def list_ollama_models(base_url: str) -> list[str]:
+async def list_ollama_models(base_url: str, api_key: str = "") -> list[str]:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{base_url}/api/tags")
+            response = await client.get(f"{base_url}/api/tags", headers=ollama_headers(api_key))
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在你电脑本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
+            detail=f"无法连接 Ollama：{base_url}。如果 Ollama 在本机运行，Docker 内应使用 http://host.docker.internal:11434，而不是 localhost。",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Ollama 获取模型请求失败：{exc}") from exc
@@ -2003,15 +2147,15 @@ def dedupe_preserve_text(items: list[str]) -> list[str]:
 
 
 def describe_ai_http_error(status_code: int, body: str, base_url: str, model: str) -> str:
-    prefix = f"AI API 返回 HTTP {status_code}。"
+    prefix = f"AI API 返回 HTTP {status_code}."
     if status_code in {401, 403}:
-        hint = "密钥无效、权限不足，或本地服务不接受该鉴权方式。"
+        hint = "请检查 API 地址、模型名称、密钥和兼容格式。"
     elif status_code == 404:
-        hint = f"接口地址或模型可能不对。当前地址：{base_url}，模型：{model}。"
+        hint = "请检查 API 地址、模型名称、密钥和兼容格式。"
     elif status_code == 429:
-        hint = "请求频率或额度受限。"
+        hint = "请检查 API 地址、模型名称、密钥和兼容格式。"
     elif status_code >= 500:
-        hint = "AI 服务端报错或本地模型服务未正常运行。"
+        hint = "请检查 API 地址、模型名称、密钥和兼容格式。"
     else:
         hint = "请检查 API 地址、模型名称、密钥和兼容格式。"
     return f"{prefix}{hint} 返回内容：{body[:500]}"
@@ -2088,25 +2232,25 @@ def build_prompt(
     return json.dumps(
         {
             "task": (
-                "根据 document_text 和 monthly_requirements 为训练日志模板字段生成可直接填写的内容。"
-                "如果字段提供 options，只能从 options 中选择。"
-                "日期、星期、时间等字段要从文档或要求中推断；训练内容、学习笔记、总结要写成适合填入训练日志的中文内容。"
-                "写作风格要参考模块C训练日志：先写一个小标题；训练内容用“本次训练的目的是...”说明目标；学习笔记按1-6条展开概念、组成、配置、验证、排错和收获；总结包含目标达成、不足之处、改进建议。"
-                "如果 custom_prompt 或 custom_skills 不为空，在不破坏 output_format 的前提下优先遵守这些自定义要求。"
-                "无法判断时 value 使用空字符串并降低 confidence。"
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
             ),
             "output_format": {
                 "answers": [
                     {
                         "name": "字段名",
-                        "value": "要写入模板的内容",
+                        "value": "瑕佸啓鍏ユā鏉跨殑鍐呭",
                         "confidence": 0.0,
                         "reason": "简短依据",
                     }
                 ]
             },
             "fields": fields,
-            "style_guide": "不要学习参考文件命名格式，只学习内容思路。内容要围绕训练计划主题写，避免空泛、乱码、占位符和无关内容。",
+            "style_guide": "请根据输入生成训练日志内容。",
             "custom_prompt": custom_prompt.strip(),
             "custom_skills": parse_custom_skills(custom_skills),
             "monthly_requirements": requirements_text,
@@ -2126,24 +2270,24 @@ def build_batch_prompt(
     return json.dumps(
         {
             "task": (
-                "monthly_requirements 是每日/每月训练任务文档，不是训练日志模板。"
-                "monthly_requirements 也可能是包含 selected_records 的 JSON；这种情况下只为 selected_records 里的对象生成日志，不要新增对象。"
-                "先从里面识别本月需要创建训练日志的对象，例如日期、周次、润联任务、训练任务、模块、课程安排或阶段。"
-                "每一个对象生成一条 record；record.title 用日期或任务名，便于用户勾选。"
-                "每条 record 都要为 fields 生成 answers，后续会按用户勾选顺序写入 DOCX 训练日志模板。"
-                "日期、星期、时间、模块、训练计划、负责教练、授课老师、训练模块、训练任务、训练内容、学习笔记、总结等字段要根据任务文档补全。"
-                "写作风格要参考模块C训练日志：每篇先写小标题；训练内容说明本次训练目的；学习笔记按1-6条围绕主题写概念、组成、配置、验证、排错和收获；总结写目标达成、不足之处、改进建议。"
-                "如果 custom_prompt 或 custom_skills 不为空，在不破坏 output_format 的前提下优先遵守这些自定义要求。"
-                "只返回严格 JSON。"
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
             ),
             "output_format": {
                 "records": [
                     {
-                        "title": "用于文件名的简短标题",
+                        "title": "训练日志",
                         "answers": [
                             {
                                 "name": "字段名",
-                                "value": "要写入模板的内容",
+                                "value": "瑕佸啓鍏ユā鏉跨殑鍐呭",
                                 "confidence": 0.0,
                                 "reason": "简短依据",
                             }
@@ -2152,7 +2296,7 @@ def build_batch_prompt(
                 ]
             },
             "fields": fields,
-            "style_guide": "不要学习参考文件命名格式，只学习内容思路。一天只生成一篇训练日志，除非同一天明确拆成多个独立日期对象。",
+            "style_guide": "请根据输入生成训练日志内容。",
             "custom_prompt": custom_prompt.strip(),
             "custom_skills": parse_custom_skills(custom_skills),
             "monthly_requirements": requirements_text,
@@ -2281,7 +2425,7 @@ def build_plan_title(module: str, plan: str, index: int) -> str:
     first_line = split_plan_lines(plan)[0] if split_plan_lines(plan) else plan
     prefix = module or "训练"
     topic = extract_topic(first_line)
-    return f"{prefix}专项训练：{topic[:24]}" if topic else f"第{index}次训练日志"
+    return f"training-log-{index}"
 
 
 def split_plan_lines(plan: str) -> list[str]:
@@ -2296,7 +2440,7 @@ def split_plan_lines(plan: str) -> list[str]:
 def extract_topic(text: str) -> str:
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     text = re.sub(r"^(完成|学习|掌握|理解|配置|训练|练习|熟悉|了解|实现)\s*", "", text)
-    text = re.split(r"[。；;，,：:]", text, maxsplit=1)[0].strip()
+    text = re.split(r"[。；;，,]", text, maxsplit=1)[0].strip()
     return text or str(text or "").strip()
 
 
@@ -2321,8 +2465,7 @@ def build_numbered_training_content(title: str, plan_lines: list[str]) -> str:
     focus = join_topics(plan_lines)
     return (
         f"{title}\n"
-        f"本次训练的目的是围绕{focus}开展专项学习和实操训练，掌握相关概念、应用场景和基础配置方法，"
-        "理解其在网络系统管理中的作用和边界，能够根据训练要求完成配置、验证与故障排查，并形成可复盘的操作记录。"
+        f"本次训练围绕{focus}开展专项学习和实操，记录关键概念、配置步骤、验证结果和排错过程。"
     )
 
 
@@ -2330,69 +2473,24 @@ def build_learning_notes(title: str, plan_lines: list[str]) -> str:
     focus = join_topics(plan_lines)
     details = concrete_learning_points(focus)
     sections = [
-        f"1. 明确训练目标\n本次学习围绕{focus}展开，重点不是只完成一次配置，而是把{details['goal']}这些关键点拆开记录，确认每一步配置对应的作用和影响范围。",
-        f"2. 梳理核心组成\n训练中先区分{details['components']}。这样可以知道哪些是前置条件，哪些是主要配置对象，哪些内容用于验证结果，避免把配置步骤混在一起。",
-        f"3. 完成配置实施\n实操时按顺序检查{details['implementation']}。每完成一步都记录关键参数、所在位置和生效对象，后续复盘时可以判断问题出在安装、授权、策略、接口还是服务状态。",
-        f"4. 做好结果验证\n验证阶段重点查看{details['verification']}。如果结果异常，先确认基础连通和服务状态，再检查权限、端口、策略匹配顺序或协议邻接关系，不直接跳到重配。",
-        f"5. 记录排错思路\n排错时按照{details['troubleshooting']}的顺序处理。每次只调整一个变量，并保留调整前后的状态截图或命令输出，避免多个修改叠加后无法判断真正原因。",
-        f"6. 整理训练收获\n通过本次训练，我对{details['takeaway']}有了更具体的理解，后续遇到同类任务时，可以先列出配置对象和验证指标，再按步骤完成实施和复盘。",
+        f"1. 明确训练目标\n本次学习围绕{focus}展开，重点记录{details['goal']}。",
+        f"2. 梳理核心组成\n训练中先区分{details['components']}，避免把配置步骤混在一起。",
+        f"3. 完成配置实施\n实操时按顺序检查{details['implementation']}，并记录关键参数和位置。",
+        f"4. 做好结果验证\n验证阶段重点查看{details['verification']}，异常时先确认基础连通和服务状态。",
+        f"5. 记录排错思路\n排错时按照{details['troubleshooting']}的顺序处理，每次只调整一个变量。",
+        f"6. 整理训练收获\n通过本次训练，对{details['takeaway']}有了更具体的理解。",
     ]
     return f"{title}\n" + "\n\n".join(sections)
 
 
 def concrete_learning_points(focus: str) -> dict[str, str]:
     text = clean_cell_text(focus).upper()
-    if any(key in text for key in ["RDS", "远程桌面", "REMOTE DESKTOP"]):
-        return {
-            "goal": "RD 会话主机、远程桌面授权、用户访问权限、客户端连接和防火墙放行",
-            "components": "RD Session Host、RD Licensing、授权模式、允许登录的用户组、3389 端口和服务器管理器中的角色状态",
-            "implementation": "安装远程桌面服务角色、指定授权服务器、设置每用户或每设备授权模式、把测试账号加入 Remote Desktop Users 组、确认防火墙远程桌面规则已启用",
-            "verification": "mstsc 客户端连接结果、事件查看器中的 RemoteDesktopServices 日志、授权诊断器提示、3389 端口监听状态和多用户会话登录情况",
-            "troubleshooting": "网络连通、3389 端口、防火墙规则、用户组权限、授权服务器可用性、服务是否启动",
-            "takeaway": "Windows RDS 从角色安装到授权、权限和连接验证的完整流程",
-        }
-    if any(key in text for key in ["EMAIL", "邮件", "SMTP", "POP", "IMAP"]):
-        return {
-            "goal": "邮件服务角色、域名和账号、SMTP/POP3/IMAP 协议、收发测试和日志排错",
-            "components": "邮件域、用户邮箱、SMTP 投递、POP3/IMAP 收取、认证方式、DNS/MX 记录和服务端口",
-            "implementation": "创建邮件域和测试账号、配置 SMTP 发送策略、开启 POP3 或 IMAP 服务、设置客户端服务器地址和认证信息、确认 25/110/143/587 等端口策略",
-            "verification": "客户端收发邮件结果、服务队列状态、邮件日志、端口连通性测试和认证失败提示",
-            "troubleshooting": "账号密码、协议端口、防火墙、DNS 解析、服务启动状态、邮件队列和日志错误码",
-            "takeaway": "邮件系统从账号、协议、端口到收发验证的配置链路",
-        }
-    if any(key in text for key in ["VLAN", "TRUNK", "802.1Q"]):
-        return {
-            "goal": "VLAN 划分、Access/Trunk 接口、802.1Q 标签、允许 VLAN 列表和跨交换机通信",
-            "components": "VLAN ID、接入口、干道口、Native VLAN、允许通过的 VLAN、交换机 MAC 地址表",
-            "implementation": "创建 VLAN、把终端接口划入对应 VLAN、配置 Trunk 链路、检查允许 VLAN 列表、确认两端封装和 Native VLAN 一致",
-            "verification": "show vlan、show interfaces trunk、MAC 地址学习结果、同 VLAN 连通性和跨 VLAN 隔离效果",
-            "troubleshooting": "VLAN 是否存在、接口模式、Trunk 允许列表、Native VLAN 不一致、物理链路和终端地址配置",
-            "takeaway": "二层 VLAN 隔离和 Trunk 承载多 VLAN 流量的工作方式",
-        }
-    if any(key in text for key in ["OSPF", "EIGRP", "路由", "邻居", "单区域"]):
-        return {
-            "goal": "路由协议进程、接口网段宣告、邻居关系、度量值和路由表收敛",
-            "components": "Router ID、区域号、network 宣告、邻居状态、接口开销、路由表和协议数据库",
-            "implementation": "确认接口 IP 和掩码、启用协议进程、宣告参与路由的网段、检查被动接口设置、根据拓扑调整 cost 或度量参数",
-            "verification": "邻居状态、协议数据库、路由表条目、端到端 ping/tracert 和接口协议状态",
-            "troubleshooting": "网段宣告错误、区域不一致、Router ID 冲突、认证不匹配、接口关闭、掩码或通配符配置错误",
-            "takeaway": "动态路由邻居建立、路由学习和故障定位的关键检查方法",
-        }
-    if any(key in text for key in ["STP", "RSTP", "MSTP", "生成树", "环路"]):
-        return {
-            "goal": "根桥选举、端口角色、阻塞/转发状态、链路冗余和二层环路防护",
-            "components": "Bridge ID、根端口、指定端口、阻塞端口、端口优先级、路径开销和实例映射",
-            "implementation": "设置根桥优先级、规划主备链路、查看端口角色和状态、按 VLAN 或实例调整生成树参数",
-            "verification": "show spanning-tree 输出、根桥位置、端口状态变化、链路故障后的收敛情况",
-            "troubleshooting": "根桥选错、端口角色异常、链路单向、实例映射错误、边缘端口配置不当",
-            "takeaway": "二层冗余环境中通过生成树控制环路和收敛路径的方法",
-        }
     return {
         "goal": f"{focus}涉及的配置对象、关键参数、验证指标和排错依据",
         "components": "配置对象、前置条件、执行步骤、验证结果和日志信息",
         "implementation": "环境参数、账号或接口信息、服务状态、策略条件和关键命令",
-        "verification": "状态输出、连通性测试、日志记录、客户端访问结果和配置生效范围",
-        "troubleshooting": "基础连通、服务状态、权限策略、参数匹配、日志提示",
+        "verification": "服务状态、连通性、日志输出、权限结果和最终业务效果",
+        "troubleshooting": "先检查基础环境，再检查配置参数、权限策略、端口连通和日志报错",
         "takeaway": f"{focus}从配置到验证再到排错的完整处理思路",
     }
 
@@ -2400,9 +2498,9 @@ def concrete_learning_points(focus: str) -> dict[str, str]:
 def build_summary_text(title: str, plan_lines: list[str]) -> str:
     focus = join_topics(plan_lines)
     return (
-        f"训练目标达成情况：本次训练围绕{focus}完成学习和实操，基本掌握了任务的核心概念、配置流程和验证方法，能够把训练计划中的要求落实到具体操作步骤中。\n\n"
+        f"训练目标达成情况：本次训练围绕{focus}完成学习和实操，基本掌握任务的核心概念、配置流程和验证方法。\n\n"
         "不足之处：部分细节仍需要继续加强，例如关键参数的适用条件、配置顺序对结果的影响，以及故障出现时如何更快定位到具体环节。\n\n"
-        "改进建议：后续训练中继续按模块整理命令和截图记录，补充每一步配置的作用说明，并针对验证失败、策略不生效或状态异常等问题做二次练习，提高独立排错能力。"
+        "后续改进：继续补充操作截图、命令输出和排错记录，形成更完整的复盘材料。"
     )
 
 
@@ -2413,7 +2511,7 @@ def split_requirement_chunks(text: str) -> list[str]:
         return date_like[:31]
     inline_parts = [
         part.strip()
-        for part in re.split(r"(?=\d{1,2}月\d{1,2}日[：:])|(?=\d{4}[/-]\d{1,2}[/-]\d{1,2}[：:])|(?=周[一二三四五六日天][：:])", text)
+        for part in re.split(r"(?=\d{1,2}月\d{1,2}日?[：:])|(?=\d{4}[/-]\d{1,2}[/-]\d{1,2}[：:])|(?=周[一二三四五六日天][：:])", text)
         if part.strip()
     ]
     if len(inline_parts) >= 2:
@@ -2461,10 +2559,10 @@ def fill_docx_batch(template_path: Path, records: list[dict[str, Any]]) -> Path:
 
 def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], output_format: str, package_mode: str) -> Path:
     if not records:
-        raise HTTPException(status_code=400, detail="没有可生成的训练日志记录。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
     normalized_format = (output_format or "docx").strip().lower()
     if normalized_format not in {"docx", "word", "pdf"}:
-        raise HTTPException(status_code=400, detail="下载格式只支持 DOCX 或 PDF。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     package_title = package_title_for_records(records)
@@ -2509,7 +2607,7 @@ def unique_package_filename(file_name: str, used_names: set[str]) -> str:
 
 def fill_docx_records(template_path: Path, records: list[dict[str, Any]]) -> Path:
     if not records:
-        raise HTTPException(status_code=400, detail="没有可生成的训练日志记录。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     base_doc: Any | None = None
     for index, record in enumerate(records):
@@ -2542,8 +2640,8 @@ ANSWER_ALIASES = {
     "训练内容": ["训练过程", "训练步骤", "实训内容", "实训过程", "实践内容"],
     "学习笔记": ["学习记录", "学习心得", "学习内容", "笔记", "实训笔记", "训练笔记"],
     "总结": ["训练总结", "学习总结", "实训总结", "小结", "训练目标达成情况", "目标达成情况"],
-    "授课老师": ["负责教练", "老师", "教练", "负责人"],
-    "负责教练": ["授课老师", "老师", "教练", "负责人"],
+    "日期": ["时间", "训练日期"],
+    "星期": ["周次", "周几"],
     "填写人": ["填表人", "记录人"],
 }
 
@@ -2617,7 +2715,7 @@ def enrich_answers_for_fields(answers: list[Any], fields: list[dict[str, Any]]) 
             "name": str(field.get("name", "")).strip(),
             "value": value,
             "confidence": 0.55,
-            "reason": "模型未返回该字段，系统根据训练任务自动补齐。",
+            "reason": "简短依据",
         })
         seen.add(name)
     return enriched
@@ -2655,14 +2753,14 @@ def convert_output_format(docx_path: Path, output_format: str) -> Path:
     if normalized in {"docx", "word"}:
         return docx_path
     if normalized != "pdf":
-        raise HTTPException(status_code=400, detail="下载格式只支持 DOCX 或 PDF。")
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
     return convert_docx_to_pdf(docx_path)
 
 
 def convert_docx_to_pdf(docx_path: Path) -> Path:
     soffice = shutil.which("libreoffice") or shutil.which("soffice")
     if not soffice:
-        raise HTTPException(status_code=500, detail="当前 Docker 镜像里没有 LibreOffice，暂时不能导出 PDF。请重新构建包含 PDF 支持的镜像。")
+        raise HTTPException(status_code=500, detail="请求失败，请检查输入或 API 配置。")
     result = subprocess.run(
         [
             soffice,
@@ -2776,7 +2874,7 @@ def fill_writer_title_paragraph(paragraph: Any, writer: str) -> None:
     text = paragraph.text
     if "选手日志" not in text:
         return
-    updated = re.sub(r"(选手日志[（(])[^）)]*([）)])", lambda match: f"{match.group(1)}{writer}{match.group(2)}", text)
+    updated = re.sub(r"(选手日志[：:])[^：:]*([：:])", lambda match: f"{match.group(1)}{writer}{match.group(2)}", text)
     if updated != text:
         set_paragraph_text(paragraph, updated)
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI 训练日志填写</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260531-11" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260604-1" />
   </head>
   <body>
     <section id="login-screen" class="login-screen">
@@ -28,8 +28,14 @@
     </section>
 
     <main id="app-shell" class="shell hidden">
-      <button id="api-settings-toggle" class="settings-toggle" type="button" aria-label="打开设置" title="设置">⚙</button>
+      <button id="api-settings-toggle" class="settings-toggle" type="button" aria-label="打开使用指南" title="使用指南">
+        <span aria-hidden="true">?</span>
+        使用指南
+      </button>
       <section class="hero">
+        <div class="hero-mark" aria-hidden="true">
+          <span class="doc-icon"></span>
+        </div>
         <div>
           <p class="eyebrow">Docker AI Training Log Filler</p>
           <h1>上传训练日志模板，自动生成并写入内容</h1>
@@ -46,9 +52,17 @@
           <section id="api-settings-panel" class="api-settings-panel hidden" aria-label="设置">
             <div class="settings-card">
               <div class="settings-head">
-                <h2>设置</h2>
-                <button id="api-settings-close" class="secondary mini" type="button" aria-label="关闭设置">关闭</button>
+                <div>
+                  <h2>设置</h2>
+                  <p>配置 API 与模型选项，优化训练日志生成体验</p>
+                </div>
+                <button id="api-settings-close" class="secondary mini" type="button" aria-label="关闭设置">×</button>
               </div>
+          <section class="settings-section base-settings-card">
+            <div class="settings-section-head">
+              <h3>基础设置</h3>
+              <p>选择兼容格式与模型，设置登录安全选项</p>
+            </div>
           <div class="api-grid">
             <label class="field">
               <span>兼容格式</span>
@@ -73,7 +87,13 @@
             </label>
             <span id="auth-settings-status"></span>
           </section>
+          </section>
 
+          <section class="settings-section model-settings-card">
+            <div class="settings-section-head">
+              <h3>模型组</h3>
+              <p>设置可用模型列表（同一 API 地址可用模型，一行一个）</p>
+            </div>
           <label class="field">
             <span>模型组（同一 API 地址可用模型，一行一个）</span>
             <textarea id="api-models" rows="3" spellcheck="false" placeholder="minimax-m25&#10;minimax-text-01&#10;minimax-reasoning"></textarea>
@@ -84,10 +104,11 @@
             <span id="model-group-status"></span>
           </div>
 
-          <label class="field">
-            <span>API 地址</span>
-            <input id="api-base-url" name="api_base_url" type="url" placeholder="https://api.openai.com/v1" />
-          </label>
+          <div class="model-group-actions">
+            <button id="use-saved-cloud-api" type="button" class="secondary">切换应用网关</button>
+            <button id="use-local-ollama-api" type="button" class="secondary">切换本机 Ollama</button>
+            <span id="api-source-status"></span>
+          </div>
 
           <label id="gpu-model-field" class="field hidden">
             <span>GPU 型号（Ollama 显示/保存用）</span>
@@ -98,14 +119,17 @@
             <button id="fetch-gpus" type="button" class="secondary">读取 GPU</button>
             <span id="gpu-status"></span>
           </div>
-
-          <section class="api-presets">
-            <div class="list-head">
-              <span>API 快速配置</span>
-              <button id="add-api-preset" type="button" class="secondary mini">新建配置</button>
-            </div>
-            <div id="api-preset-list" class="preset-list"></div>
           </section>
+
+          <section class="settings-section api-config-card">
+            <div class="settings-section-head">
+              <h3>API 配置</h3>
+              <p>配置 API 地址与密钥，用于调用模型服务</p>
+            </div>
+          <label id="api-base-url-field" class="field">
+            <span>API 地址</span>
+            <input id="api-base-url" name="api_base_url" type="url" placeholder="https://api.openai.com/v1" />
+          </label>
 
           <label id="api-key-field" class="field">
             <span>API 密钥</span>
@@ -127,8 +151,27 @@
             <button id="unload-model" type="button" class="secondary hidden">关闭模型</button>
             <span id="api-test-status"></span>
           </div>
+          </section>
 
-          <section class="account-backup">
+          <section class="settings-section api-preset-card">
+            <div class="settings-section-head">
+              <h3>API 快速配置</h3>
+              <p>预设常用 API 配置，一键切换，快速使用</p>
+            </div>
+          <section class="api-presets">
+            <div class="list-head">
+              <span>API 快速配置</span>
+              <button id="add-api-preset" type="button" class="secondary mini">新建配置</button>
+            </div>
+            <div id="api-preset-list" class="preset-list"></div>
+          </section>
+          </section>
+
+          <section class="settings-section account-backup">
+            <div class="settings-section-head">
+              <h3>配置备份</h3>
+              <p>导出或导入配置，快速备份与恢复</p>
+            </div>
             <div class="list-head">
               <span>配置备份</span>
             </div>
@@ -140,7 +183,7 @@
             </div>
           </section>
 
-          <section class="module-config">
+          <section class="settings-section module-config">
             <div class="module-head">
               <h3>模块选项</h3>
               <label class="checkline">
@@ -184,6 +227,10 @@
               </div>
             </div>
           </section>
+          <div class="settings-footer">
+            <button id="settings-cancel" type="button" class="secondary">取消</button>
+            <button id="settings-save-close" type="button">保存并关闭</button>
+          </div>
             </div>
           </section>
 
@@ -229,6 +276,7 @@
             <button id="quick-restart-model" type="button" class="secondary hidden">重启模型</button>
             <button id="quick-unload-model" type="button" class="secondary hidden">关闭模型</button>
             <span id="current-api-summary" class="api-summary">当前 API：未加载</span>
+            <span id="quick-api-test-status" class="api-summary"></span>
           </div>
           </section>
 
@@ -448,11 +496,28 @@
           </section>
           <div id="download-slot"></div>
           <div id="results" class="results empty">结果会显示在这里。</div>
+          <section class="side-card process-card">
+            <h3>处理流程</h3>
+            <ol>
+              <li>解析训练计划数据</li>
+              <li>读取日志模板（DOCX）</li>
+              <li>AI 生成内容并填充</li>
+              <li>保存生成的文档文件</li>
+            </ol>
+          </section>
+          <section class="side-card tips-card">
+            <h3>温馨提示</h3>
+            <ul>
+              <li>建议先进行 API 测试，确保连接正常</li>
+              <li>Excel 数据格式请参考下载模板</li>
+              <li>生成的文件会保存在本地指定目录</li>
+            </ul>
+          </section>
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260531-15"></script>
-    <script src="/static/api-presets.js?v=20260531-3"></script>
+    <script src="/static/app.js?v=20260603-11"></script>
+    <script src="/static/api-presets.js?v=20260603-12"></script>
     <script src="/static/secret-toggle.js?v=20260528-1"></script>
   </body>
 </html>
