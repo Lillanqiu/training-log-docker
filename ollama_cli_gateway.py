@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -31,15 +32,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         prompt = self.prompt_from_payload(payload)
         try:
-            content = run_ollama(model, prompt)
+            result = run_ollama(model, prompt)
         except subprocess.CalledProcessError as exc:
             self.send_json({"error": (exc.stderr or exc.stdout or str(exc))[-2000:]}, 502)
             return
+        content = result["content"]
+        usage = {
+            "prompt_eval_count": estimate_token_count(prompt),
+            "eval_count": estimate_token_count(content),
+            "total_tokens": estimate_token_count(prompt) + estimate_token_count(content),
+            "duration_seconds": result["duration_seconds"],
+            "token_source": "estimated",
+        }
 
         if self.path.rstrip("/") == "/api/generate":
-            self.send_json({"response": content, "done": True})
+            self.send_json({"response": content, "done": True, **usage})
         else:
-            self.send_json({"message": {"role": "assistant", "content": content}, "done": True})
+            self.send_json({"message": {"role": "assistant", "content": content}, "done": True, **usage})
 
     def read_json(self) -> dict:
         size = int(self.headers.get("Content-Length") or "0")
@@ -91,7 +100,8 @@ def model_names() -> list[str]:
     return names
 
 
-def run_ollama(model: str, prompt: str) -> str:
+def run_ollama(model: str, prompt: str) -> dict:
+    started = time.perf_counter()
     result = subprocess.run(
         [str(OLLAMA_EXE), "run", model, prompt],
         text=True,
@@ -101,7 +111,20 @@ def run_ollama(model: str, prompt: str) -> str:
         timeout=600,
         check=True,
     )
-    return clean_ollama_output(result.stdout)
+    return {
+        "content": clean_ollama_output(result.stdout),
+        "duration_seconds": round(time.perf_counter() - started, 2),
+    }
+
+
+def estimate_token_count(text: str) -> int:
+    text = str(text or "")
+    if not text.strip():
+        return 0
+    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    ascii_words = len(re.findall(r"[A-Za-z0-9_]+", text))
+    other_chars = max(0, len(text) - chinese_chars)
+    return max(1, int(chinese_chars * 1.15 + ascii_words * 1.25 + other_chars / 4))
 
 
 def clean_ollama_output(output: str) -> str:

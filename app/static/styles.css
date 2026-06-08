@@ -1012,6 +1012,31 @@ button.mini {
   line-height: 1.5;
 }
 
+.generation-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+
+.generation-stat-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border: 1px solid #dce8e2;
+  border-radius: 999px;
+  background: #f6fbf8;
+  color: #52616b;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.generation-stat-pill b {
+  color: var(--primary);
+  font-weight: 900;
+}
+
 .context-menu {
   position: fixed;
   z-index: 120;

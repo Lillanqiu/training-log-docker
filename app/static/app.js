@@ -124,9 +124,12 @@ let importedRecords = [];
 let importedPlanSignature = "";
 let batchProgressTimer = null;
 let currentBatchJobId = "";
+let batchPollFailures = 0;
+const criticalClickBindings = new WeakSet();
 let promptPresets = loadPromptPresets();
 let skillsPresets = loadSkillsPresets();
 
+bindTopActionButtons();
 loadSavedConfig();
 renderPromptPresets();
 renderSkillsPresets();
@@ -143,6 +146,47 @@ syncOllamaModelControls();
 initAuth();
 initWorkspaceResizer();
 moveGenerationSettingsToSettingsPanel();
+
+function bindCriticalClick(element, handler) {
+  if (!element || criticalClickBindings.has(element)) return;
+  criticalClickBindings.add(element);
+  element.addEventListener("click", handler);
+}
+
+function restoreTopActionButtons() {
+  [
+    batchFillModeButton,
+    manualModeButton,
+    requirementsTextModeButton,
+    requirementsLinkModeButton,
+    quickApiSettingsDetailButton,
+    quickApiTestButton,
+    importPlanButton,
+    parsePlanFileButton,
+  ].forEach((button) => {
+    if (!button) return;
+    button.disabled = false;
+    button.removeAttribute("aria-disabled");
+  });
+}
+
+function bindTopActionButtons() {
+  bindCriticalClick(batchFillModeButton, () => setFillMode(true));
+  bindCriticalClick(manualModeButton, () => setFillMode(false));
+  bindCriticalClick(requirementsLinkModeButton, () => setRequirementsSourceMode("link"));
+  bindCriticalClick(requirementsTextModeButton, () => setRequirementsSourceMode("text"));
+  bindCriticalClick(quickApiSettingsDetailButton, () => {
+    apiSettingsPanel?.classList.remove("hidden");
+  });
+  bindCriticalClick(quickApiTestButton, () => runApiTest());
+  bindCriticalClick(importPlanButton, async () => {
+    await importPlan();
+  });
+  bindCriticalClick(parsePlanFileButton, async () => {
+    await parseUploadedPlanFile();
+  });
+  restoreTopActionButtons();
+}
 
 function moveGenerationSettingsToSettingsPanel() {
   if (!settingsCard || !customModeInput || settingsCard.querySelector("#generation-settings")) return;
@@ -324,7 +368,7 @@ defaultCoachSelect.addEventListener("contextmenu", (event) => {
     onDelete: deleteTeacher,
   });
 });
-apiSettingsToggle.addEventListener("click", () => {
+apiSettingsToggle?.addEventListener("click", () => {
   apiSettingsPanel.classList.remove("hidden");
 });
 apiSettingsClose.addEventListener("click", () => {
@@ -342,14 +386,14 @@ apiSettingsPanel.addEventListener("click", (event) => {
     apiSettingsPanel.classList.add("hidden");
   }
 });
-quickApiSettingsDetailButton?.addEventListener("click", () => {
-  apiSettingsPanel.classList.remove("hidden");
+bindCriticalClick(quickApiSettingsDetailButton, () => {
+  apiSettingsPanel?.classList.remove("hidden");
 });
-quickApiTestButton.addEventListener("click", () => runApiTest());
-quickPreloadModelButton.addEventListener("click", () => preloadModelButton.click());
-quickRestartModelButton.addEventListener("click", () => restartModelButton.click());
-quickUnloadModelButton.addEventListener("click", () => unloadModelButton.click());
-fetchGpusButton.addEventListener("click", () => fetchGpuModels());
+bindCriticalClick(quickApiTestButton, () => runApiTest());
+quickPreloadModelButton?.addEventListener("click", () => preloadModelButton?.click());
+quickRestartModelButton?.addEventListener("click", () => restartModelButton?.click());
+quickUnloadModelButton?.addEventListener("click", () => unloadModelButton?.click());
+fetchGpusButton?.addEventListener("click", () => fetchGpuModels());
 ["#api-format", "#api-base-url", "#api-model"].forEach((selector) => {
   const control = document.querySelector(selector);
   control?.addEventListener("input", updateApiSummary);
@@ -368,19 +412,31 @@ deleteSkillsPresetButton.addEventListener("click", () => deleteSkillsPreset());
 promptModeButton.addEventListener("click", () => setCustomMode("prompt"));
 skillsModeButton.addEventListener("click", () => setCustomMode("skills"));
 cancelBatchButton.addEventListener("click", async () => {
-  if (!currentBatchJobId) return;
-  cancelBatchButton.disabled = true;
+  const jobId = currentBatchJobId;
+  if (!jobId) {
+    batchProgressDetail.textContent = "任务还没有创建成功，当前没有可取消的后台任务。";
+    setCancelBatchButton(false, false);
+    return;
+  }
+  setCancelBatchButton(false, true, "正在取消");
   batchProgressDetail.textContent = "正在取消批量生成...";
   try {
-    await fetch(`/api/jobs/${currentBatchJobId}`, { method: "DELETE" });
-  } catch {
-    batchProgressDetail.textContent = "取消请求发送失败，请稍后查看任务状态。";
+    const response = await fetch(`/api/jobs/${jobId}`, { method: "DELETE" });
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "取消请求失败");
+    }
+    window.clearTimeout(batchProgressTimer);
+    scheduleBatchPoll(jobId, 350);
+  } catch (error) {
+    batchProgressDetail.textContent = humanFetchError(error);
+    setCancelBatchButton(true, true);
   }
 });
-manualModeButton.addEventListener("click", () => setFillMode(false));
-batchFillModeButton.addEventListener("click", () => setFillMode(true));
-requirementsLinkModeButton?.addEventListener("click", () => setRequirementsSourceMode("link"));
-requirementsTextModeButton?.addEventListener("click", () => setRequirementsSourceMode("text"));
+bindCriticalClick(manualModeButton, () => setFillMode(false));
+bindCriticalClick(batchFillModeButton, () => setFillMode(true));
+bindCriticalClick(requirementsLinkModeButton, () => setRequirementsSourceMode("link"));
+bindCriticalClick(requirementsTextModeButton, () => setRequirementsSourceMode("text"));
 moduleList.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   if (event.target.closest(".config-row")) return;
@@ -466,18 +522,18 @@ form.addEventListener("submit", async (event) => {
     renderResults(payload);
     copyButton.disabled = false;
   } catch (error) {
-    failBatchProgress(error.message);
+    failBatchProgress(humanFetchError(error));
     statusPill.textContent = "失败";
     results.className = "results empty";
-    results.textContent = error.message;
+    results.textContent = humanFetchError(error);
   }
 });
 
-importPlanButton.addEventListener("click", async () => {
+bindCriticalClick(importPlanButton, async () => {
   await importPlan();
 });
 
-parsePlanFileButton.addEventListener("click", async () => {
+async function parseUploadedPlanFile() {
   const planFile = document.querySelector("#plan-file").files[0];
   if (!planFile) {
     planFileStatus.textContent = "请先在“训练计划 Excel”里选择 XLSX/CSV 文件。";
@@ -490,6 +546,10 @@ parsePlanFileButton.addEventListener("click", async () => {
   }
   const imported = await importPlan();
   planFileStatus.textContent = imported ? "表格解析完成，请勾选要生成的训练计划。" : "表格解析失败，请检查列名或内容。";
+}
+
+bindCriticalClick(parsePlanFileButton, async () => {
+  await parseUploadedPlanFile();
 });
 
 async function importPlan() {
@@ -1495,35 +1555,38 @@ function renderResults(payload) {
     renderBatchResults(payload.records);
     return;
   }
+  const statCard = createGenerationStatsNode(payload.generation_stats);
+  const answerCards = payload.answers.map((answer) => {
+    const card = document.createElement("article");
+    card.className = "answer";
+
+    const top = document.createElement("div");
+    top.className = "answer-top";
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = answer.name || "未命名字段";
+
+    const confidence = document.createElement("div");
+    confidence.className = "confidence";
+    const score = Number(answer.confidence || 0);
+    confidence.textContent = `置信度 ${Math.round(score * 100)}%`;
+
+    const value = document.createElement("div");
+    value.className = "value";
+    value.textContent = answer.value || "未判断";
+
+    const reason = document.createElement("div");
+    reason.className = "reason";
+    reason.textContent = answer.reason || "";
+
+    top.append(name, confidence);
+    card.append(top, value, reason);
+    return card;
+  });
   results.replaceChildren(
-    ...payload.answers.map((answer) => {
-      const card = document.createElement("article");
-      card.className = "answer";
-
-      const top = document.createElement("div");
-      top.className = "answer-top";
-
-      const name = document.createElement("div");
-      name.className = "name";
-      name.textContent = answer.name || "未命名字段";
-
-      const confidence = document.createElement("div");
-      confidence.className = "confidence";
-      const score = Number(answer.confidence || 0);
-      confidence.textContent = `置信度 ${Math.round(score * 100)}%`;
-
-      const value = document.createElement("div");
-      value.className = "value";
-      value.textContent = answer.value || "未判断";
-
-      const reason = document.createElement("div");
-      reason.className = "reason";
-      reason.textContent = answer.reason || "";
-
-      top.append(name, confidence);
-      card.append(top, value, reason);
-      return card;
-    })
+    ...(statCard ? [statCard] : []),
+    ...answerCards
   );
 }
 
@@ -1673,21 +1736,25 @@ async function runBatchJob() {
       throw new Error(job.detail || "批量任务创建失败");
     }
     currentBatchJobId = job.id;
-    await pollBatchJob(job.id);
+    batchPollFailures = 0;
+    setCancelBatchButton(true, true);
+    renderBatchJobProgress(job);
+    scheduleBatchPoll(job.id, 700);
   } catch (error) {
-    failBatchProgress(error.message);
+    failBatchProgress(humanFetchError(error));
     statusPill.textContent = "失败";
     results.className = "results empty";
-    results.textContent = error.message;
+    results.textContent = humanFetchError(error);
   }
 }
 
 function startBatchProgress(total) {
   window.clearTimeout(batchProgressTimer);
   currentBatchJobId = "";
+  batchPollFailures = 0;
   const safeTotal = Math.max(total, 1);
   batchProgressPanel.classList.remove("hidden");
-  cancelBatchButton.disabled = false;
+  setCancelBatchButton(false, false);
   updateBatchProgress(0, "批量生成中", `0/${safeTotal}`, "正在提交后台任务...");
 }
 
@@ -1695,12 +1762,15 @@ async function pollBatchJob(jobId) {
   const response = await fetch(`/api/jobs/${jobId}`);
   const job = await readResponse(response);
   if (!response.ok) {
-    throw new Error(job.detail || "读取批量任务进度失败");
+    const error = new Error(job.detail || "读取批量任务进度失败");
+    error.status = response.status;
+    throw error;
   }
+  batchPollFailures = 0;
   renderBatchJobProgress(job);
   if (job.status === "complete") {
     currentBatchJobId = "";
-    cancelBatchButton.disabled = true;
+    setCancelBatchButton(false, false);
     lastPayload = job.result;
     renderResults(job.result);
     copyButton.disabled = false;
@@ -1708,7 +1778,7 @@ async function pollBatchJob(jobId) {
   }
   if (job.status === "failed") {
     currentBatchJobId = "";
-    cancelBatchButton.disabled = true;
+    setCancelBatchButton(false, false);
     if (job.partial_result) {
       lastPayload = job.partial_result;
       renderResults(job.partial_result);
@@ -1720,18 +1790,50 @@ async function pollBatchJob(jobId) {
   }
   if (job.status === "canceled") {
     currentBatchJobId = "";
-    cancelBatchButton.disabled = true;
+    setCancelBatchButton(false, false);
+    updateBatchProgress(0, "批量生成已取消", batchProgressCount.textContent || "0/0", job.message || "批量生成已取消。");
     statusPill.textContent = "已取消";
     results.className = "results empty";
     results.textContent = "批量生成已取消，可以修改内容后重新生成。";
     return;
   }
-  batchProgressTimer = window.setTimeout(() => pollBatchJob(jobId).catch((error) => {
-    failBatchProgress(error.message);
-    statusPill.textContent = "失败";
-    results.className = "results empty";
-    results.textContent = error.message;
-  }), 1200);
+  setCancelBatchButton(true, true);
+  scheduleBatchPoll(jobId);
+}
+
+function scheduleBatchPoll(jobId, delay = 1200) {
+  window.clearTimeout(batchProgressTimer);
+  batchProgressTimer = window.setTimeout(() => {
+    pollBatchJob(jobId).catch((error) => handleBatchPollError(jobId, error));
+  }, delay);
+}
+
+function handleBatchPollError(jobId, error) {
+  if (currentBatchJobId !== jobId) return;
+  const retryable = !error.status || error.status >= 500;
+  if (retryable && batchPollFailures < 8) {
+    batchPollFailures += 1;
+    statusPill.textContent = "重连中";
+    batchProgressTitle.textContent = "连接中断，正在重试";
+    batchProgressDetail.textContent = `${humanFetchError(error)} 正在第 ${batchPollFailures} 次重试...`;
+    setCancelBatchButton(true, true);
+    scheduleBatchPoll(jobId, Math.min(1600 + batchPollFailures * 500, 5000));
+    return;
+  }
+  failBatchProgress(humanFetchError(error), null, {
+    keepJobId: retryable,
+    canCancel: retryable,
+    title: retryable ? "连接中断" : "",
+  });
+  statusPill.textContent = "失败";
+  results.className = "results empty";
+  results.textContent = humanFetchError(error);
+}
+
+function setCancelBatchButton(enabled, visible = true, label = "取消生成") {
+  cancelBatchButton.disabled = !enabled;
+  cancelBatchButton.classList.toggle("hidden", !visible);
+  cancelBatchButton.textContent = label;
 }
 
 function renderBatchJobProgress(job) {
@@ -1759,19 +1861,23 @@ function finishBatchProgress(payload) {
   updateBatchProgress(100, "批量生成完成", `${total}/${total}`, payload.used_ai ? "已使用当前模型生成并写入完成。" : "已使用本地兜底生成并写入完成。");
 }
 
-function failBatchProgress(message, partialPayload = null) {
+function failBatchProgress(message, partialPayload = null, options = {}) {
   window.clearTimeout(batchProgressTimer);
-  currentBatchJobId = "";
-  cancelBatchButton.disabled = true;
+  if (!options.keepJobId) {
+    currentBatchJobId = "";
+  }
+  setCancelBatchButton(Boolean(options.canCancel && currentBatchJobId), Boolean(options.canCancel && currentBatchJobId));
   if (batchProgressPanel.classList.contains("hidden")) return;
-  batchProgressTitle.textContent = partialPayload ? "批量生成中断" : "批量生成失败";
+  batchProgressTitle.textContent = options.title || (partialPayload ? "批量生成中断" : "批量生成失败");
   batchProgressDetail.textContent = message || "生成失败，请检查任务内容和 API 配置。";
 }
 
 function resetBatchProgress() {
   window.clearTimeout(batchProgressTimer);
   currentBatchJobId = "";
+  batchPollFailures = 0;
   batchProgressPanel.classList.add("hidden");
+  setCancelBatchButton(false, false);
   batchProgressFill.style.width = "0";
   batchProgressCount.textContent = "0/0";
   batchProgressDetail.textContent = "正在准备生成任务...";
@@ -1790,6 +1896,7 @@ function setFillMode(batchMode) {
   if (batchMode) {
     setRequirementsSourceMode(requirementsSourceModeInput?.value || "text", { silent: true });
   }
+  restoreTopActionButtons();
 }
 
 function setRequirementsSourceMode(mode, options = {}) {
@@ -1806,6 +1913,7 @@ function setRequirementsSourceMode(mode, options = {}) {
   if (!options.silent) {
     clearImportedRecords("任务来源已切换，请重新导入训练计划。");
   }
+  restoreTopActionButtons();
 }
 
 function setPanelFieldsDisabled(panels, disabled) {
@@ -1839,8 +1947,10 @@ function renderBatchResults(records) {
       const summary = document.createElement("div");
       summary.className = "reason";
       summary.textContent = `已生成 ${Array.isArray(record.answers) ? record.answers.length : 0} 个字段`;
+      const stats = createGenerationStatsNode(record.generation_stats);
 
       card.append(title, summary);
+      if (stats) card.append(stats);
       return card;
     })
   );
@@ -1916,7 +2026,7 @@ function folderZipUrlFromPath(folderPath) {
 function renderPreview(payload) {
   const records = payload.batch && Array.isArray(payload.records)
     ? payload.records
-    : [{ title: payload.filename || "训练日志", answers: payload.answers || [] }];
+    : [{ title: payload.filename || "训练日志", answers: payload.answers || [], generation_stats: payload.generation_stats }];
   previewList.replaceChildren(...records.map((record, index) => createPreviewCard(record, index)));
   previewPanel.classList.remove("hidden");
 }
@@ -1928,6 +2038,8 @@ function createPreviewCard(record, index) {
   const title = document.createElement("h4");
   title.textContent = `${index + 1}. ${record.title || "训练日志"}`;
   card.append(title);
+  const stats = createGenerationStatsNode(record.generation_stats);
+  if (stats) card.append(stats);
 
   const answers = Array.isArray(record.answers) ? record.answers : [];
   const table = document.createElement("table");
@@ -1948,6 +2060,41 @@ function createPreviewCard(record, index) {
   );
   card.append(table);
   return card;
+}
+
+function createGenerationStatsNode(stats) {
+  if (!stats || typeof stats !== "object") return null;
+  const row = document.createElement("div");
+  row.className = "generation-stats";
+  const sourceLabel = stats.token_source === "api"
+    ? "精确"
+    : stats.token_source === "allocated"
+      ? "按篇分摊"
+      : stats.token_source === "none"
+        ? "无 token"
+        : "估算";
+  const total = Number(stats.total_tokens || 0);
+  const input = Number(stats.input_tokens || 0);
+  const output = Number(stats.output_tokens || 0);
+  const duration = Number(stats.duration_seconds || 0);
+  row.replaceChildren(
+    statPill("耗时", duration ? `${duration.toFixed(duration >= 10 ? 1 : 2)} 秒` : "0 秒"),
+    statPill("Token", total ? `${total}（入 ${input} / 出 ${output}）` : "未统计"),
+    statPill("来源", sourceLabel),
+    statPill("模型", stats.model || "未知模型")
+  );
+  return row;
+}
+
+function statPill(label, value) {
+  const item = document.createElement("span");
+  item.className = "generation-stat-pill";
+  const name = document.createElement("b");
+  name.textContent = `${label}：`;
+  const text = document.createElement("span");
+  text.textContent = value;
+  item.append(name, text);
+  return item;
 }
 
 function previewRow(items) {

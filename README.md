@@ -12,6 +12,7 @@
 - 支持 OpenAI 兼容接口、DeepSeek 兼容接口、本机 Ollama、本机 Ollama 应用网关。
 - 支持把生成结果写回 DOCX，并可导出 PDF。
 - 支持批量生成多个文档，输出文件夹或 ZIP。
+- 支持显示每一篇训练日志的生成耗时和 token 消耗。
 - 支持多用户登录，每个用户保存自己的 API 配置。
 - 支持导出和导入账号配置备份。
 - 支持 Ollama 已登录应用/CLI 的云端模型网关，例如 `gemma4:31b-cloud`、`minimax-m3:cloud`。
@@ -44,7 +45,107 @@
 
 Docker Desktop 安装后，打开 Docker Desktop，并确认左下角或状态栏显示 Docker 正在运行。
 
-### 2. 进入项目目录
+### 2. 获取项目代码
+
+如果项目放在 GitHub 或其他 Git 仓库，推荐用 `git clone` 拉取。
+
+先选择一个保存项目的目录，例如：
+
+```powershell
+cd "C:\Users\你的用户名\Documents"
+```
+
+然后执行：
+
+```powershell
+git clone 仓库地址
+```
+
+示例：
+
+```powershell
+git clone https://github.com/你的用户名/训练日志.git
+```
+
+如果仓库名是英文，例如 `training-log`：
+
+```powershell
+git clone https://github.com/你的用户名/training-log.git
+```
+
+本项目当前仓库示例：
+
+```powershell
+git clone https://github.com/Lillanqiu/training-log-docker.git
+cd training-log-docker
+```
+
+执行完上面两个命令后，PowerShell 提示符应该类似这样：
+
+```text
+PS C:\Users\Skills\training-log-docker>
+```
+
+这说明你已经进入项目目录，接下来就可以继续复制配置文件并启动 Docker。
+
+拉取完成后会生成一个项目文件夹：
+
+```text
+Documents/
+└─ training-log/
+```
+
+进入项目目录：
+
+```powershell
+cd .\training-log
+```
+
+如果你已经有项目目录，只是想更新最新代码，在项目目录里执行：
+
+```powershell
+git pull
+```
+
+如果你没有安装 Git，也可以在 GitHub 页面点击 `Code`，选择 `Download ZIP`，下载后解压到本机目录。解压后进入包含 `docker-compose.yml` 和 `README.md` 的那一层目录。
+
+确认当前目录正确：
+
+```powershell
+Get-ChildItem
+```
+
+正常应该能看到这些文件：
+
+```text
+Dockerfile
+docker-compose.yml
+requirements.txt
+README.md
+app
+config
+```
+
+如果你看到这些文件，就继续执行：
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build -d
+```
+
+启动完成后打开浏览器访问：
+
+```text
+http://127.0.0.1:18080
+```
+
+如果想确认服务是否启动成功：
+
+```powershell
+docker compose ps
+```
+
+### 3. 进入项目目录
 
 PowerShell 示例：
 
@@ -52,7 +153,13 @@ PowerShell 示例：
 cd "C:\Users\lillan\OneDrive\文档\训练日志"
 ```
 
-### 3. 准备环境变量文件
+如果你是刚刚用 `git clone` 拉下来的项目，就进入你实际 clone 出来的目录，例如：
+
+```powershell
+cd "C:\Users\你的用户名\Documents\training-log"
+```
+
+### 4. 准备环境变量文件
 
 复制示例文件：
 
@@ -81,7 +188,7 @@ AI_MODEL=gpt-4.1-mini
 
 如果你主要在网页里配置 API，`.env` 里的 AI 配置可以留空或保持默认。
 
-### 4. 启动服务
+### 5. 启动服务
 
 第一次启动会下载基础镜像并安装依赖，耗时会久一些：
 
@@ -107,7 +214,7 @@ docker compose logs -f
 http://127.0.0.1:18080
 ```
 
-### 5. 停止服务
+### 6. 停止服务
 
 ```powershell
 docker compose down
@@ -210,7 +317,7 @@ http://127.0.0.1:8000
 
 ## API 配置说明
 
-页面右上角“使用指南/设置”会打开设置面板。里面主要有这些区域：
+页面里的“详细设置”会打开设置面板。里面主要有这些区域：
 
 - 基础设置：选择 API 兼容格式和当前模型。
 - 模型组：维护同一 API 地址可用的模型列表，一行一个。
@@ -438,6 +545,24 @@ Docker 容器内路径是：
 - 生成文件夹，不压缩。
 - 生成 ZIP，便于一次下载。
 
+## 生成统计
+
+每次生成完成后，页面会在结果预览和生成列表里显示每一篇训练日志的统计信息：
+
+- 耗时：这一篇从发起模型请求到拿到结果的大致时间。
+- Token：输入 token、输出 token 和总 token。
+- 来源：显示 token 是 API 返回的精确值、系统估算值，还是批量一次生成后按篇分摊。
+- 模型：本次生成使用的模型名称。
+
+不同模型来源的统计方式略有区别：
+
+- OpenAI 兼容 API：如果接口返回 `usage`，页面显示接口返回的精确 token；如果接口没有返回 `usage`，系统会按文本长度估算。
+- 本机 Ollama API：如果 Ollama 返回 `prompt_eval_count` 和 `eval_count`，页面显示 Ollama 返回的 token；如果没有返回，也会自动估算。
+- Ollama 应用网关：因为 `ollama.exe run` 的 CLI 输出通常不给标准 token 统计，所以网关会记录真实调用耗时，并按提示词和输出内容估算 token。
+- 本地兜底生成：没有调用模型，token 显示为未统计。
+
+批量生成时，如果系统是一篇一篇调用模型，每篇会显示自己的耗时和 token。若使用一次模型调用生成多篇内容，后端会把这次请求的 token 和耗时按篇分摊显示。
+
 ## 多用户和配置保存
 
 运行时配置保存在 `config/` 目录：
@@ -560,4 +685,3 @@ Docker 镜像里安装了 `fonts-noto-cjk`。如果 PDF 仍显示异常，检查
 - `backups/`
 
 API 密钥会保存在本地配置里。只建议在你自己的电脑或可信服务器上使用。
-

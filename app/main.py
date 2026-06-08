@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta
@@ -628,6 +629,7 @@ async def fill_form(
                 )
             else:
                 batch_result = {"used_ai": False, "records": imported_records}
+                attach_stats_to_records(batch_result["records"], fallback_generation_stats(0))
         else:
             batch_result = await generate_batch_records(
                 document_text[:MAX_TEXT_CHARS],
@@ -682,6 +684,7 @@ async def fill_form(
             set_record_answer(manual_record, "模块", manual_module.strip(), 0.9, "来自手动填写。")
             set_record_answer(manual_record, "训练模块", manual_module.strip(), 0.9, "来自手动填写。")
         result = {"used_ai": False, "answers": manual_record["answers"]}
+        result["generation_stats"] = fallback_generation_stats(0)
     else:
         result = await generate_answers(
             document_text[:MAX_TEXT_CHARS],
@@ -703,6 +706,7 @@ async def fill_form(
         "used_ai": result["used_ai"],
         "batch": False,
         "answers": result["answers"],
+        "generation_stats": result.get("generation_stats", fallback_generation_stats(0)),
         "download_url": download_url,
         "source_preview": document_text[:1200],
         "requirements_preview": requirements_text[:1200],
@@ -996,6 +1000,98 @@ def can_use_ai(api_config: dict[str, str]) -> bool:
     return bool(api_config["api_key"])
 
 
+def estimate_token_count(text: str) -> int:
+    text = str(text or "")
+    if not text.strip():
+        return 0
+    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    ascii_words = len(re.findall(r"[A-Za-z0-9_]+", text))
+    other_chars = max(0, len(text) - chinese_chars)
+    return max(1, int(chinese_chars * 1.15 + ascii_words * 1.25 + other_chars / 4))
+
+
+def build_generation_stats(
+    provider: str,
+    model: str,
+    prompt: str = "",
+    content: str = "",
+    usage: dict[str, Any] | None = None,
+    duration_seconds: float = 0,
+    token_source: str = "estimated",
+) -> dict[str, Any]:
+    usage = usage or {}
+    input_tokens = int(
+        usage.get("prompt_tokens")
+        or usage.get("input_tokens")
+        or usage.get("prompt_eval_count")
+        or usage.get("prompt_tokens_estimated")
+        or 0
+    )
+    output_tokens = int(
+        usage.get("completion_tokens")
+        or usage.get("output_tokens")
+        or usage.get("eval_count")
+        or usage.get("completion_tokens_estimated")
+        or 0
+    )
+    if not input_tokens:
+        input_tokens = estimate_token_count(prompt)
+        token_source = "estimated" if token_source == "api" else token_source
+    if not output_tokens:
+        output_tokens = estimate_token_count(content)
+        token_source = "estimated" if token_source == "api" else token_source
+    total_tokens = int(usage.get("total_tokens") or usage.get("total_tokens_estimated") or input_tokens + output_tokens)
+    return {
+        "provider": provider,
+        "model": model,
+        "duration_seconds": round(float(duration_seconds or 0), 2),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "token_source": token_source,
+    }
+
+
+def fallback_generation_stats(duration_seconds: float = 0) -> dict[str, Any]:
+    return {
+        "provider": "local-fallback",
+        "model": "本地兜底",
+        "duration_seconds": round(float(duration_seconds or 0), 2),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "token_source": "none",
+    }
+
+
+def scale_generation_stats(stats: dict[str, Any], count: int) -> list[dict[str, Any]]:
+    if count <= 0:
+        return []
+    input_each = round((int(stats.get("input_tokens") or 0)) / count)
+    output_each = round((int(stats.get("output_tokens") or 0)) / count)
+    total_each = round((int(stats.get("total_tokens") or 0)) / count)
+    duration_each = round((float(stats.get("duration_seconds") or 0)) / count, 2)
+    return [
+        {
+            **stats,
+            "duration_seconds": duration_each,
+            "input_tokens": input_each,
+            "output_tokens": output_each,
+            "total_tokens": total_each,
+            "token_source": "allocated" if stats.get("token_source") != "none" else "none",
+        }
+        for _ in range(count)
+    ]
+
+
+def attach_stats_to_records(records: list[dict[str, Any]], stats: dict[str, Any] | list[dict[str, Any]] | None) -> None:
+    if not records or not stats:
+        return
+    stats_list = stats if isinstance(stats, list) else scale_generation_stats(stats, len(records))
+    for record, record_stats in zip(records, stats_list):
+        record["generation_stats"] = record_stats
+
+
 def build_selected_records_requirements(records: list[dict[str, Any]], requirements_text: str) -> str:
     return json.dumps(
         {
@@ -1052,6 +1148,7 @@ async def run_fill_job(
                 record = result["records"][0] if result["records"] else selected_record
             else:
                 record = selected_record
+                record["generation_stats"] = fallback_generation_stats(0)
             apply_plan_defaults(
                 [record],
                 defaults["start_date"],
@@ -1811,7 +1908,9 @@ async def generate_answers(
     model = api_config["model"]
 
     if api_format == "openai" and not api_key:
-        return {"used_ai": False, "answers": heuristic_answers(document_text, requirements_text, fields)}
+        started = time.perf_counter()
+        answers = heuristic_answers(document_text, requirements_text, fields)
+        return {"used_ai": False, "answers": answers, "generation_stats": fallback_generation_stats(time.perf_counter() - started)}
 
     prompt = build_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
@@ -1836,14 +1935,19 @@ async def generate_batch_records(
     model = api_config["model"]
 
     if api_format == "openai" and not api_key:
-        return {"used_ai": False, "records": heuristic_batch_records(document_text, requirements_text, fields)}
+        started = time.perf_counter()
+        records = heuristic_batch_records(document_text, requirements_text, fields)
+        attach_stats_to_records(records, fallback_generation_stats(time.perf_counter() - started))
+        return {"used_ai": False, "records": records}
 
     prompt = build_batch_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
-        content = await call_ollama_raw(base_url, model, prompt, api_config["api_key"])
+        raw_result = await call_ollama_raw_with_stats(base_url, model, prompt, api_config["api_key"])
     else:
-        content = await call_openai_compatible_raw(base_url, api_key, model, prompt)
-    return {"used_ai": True, "records": parse_batch_json(content)}
+        raw_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
+    records = parse_batch_json(raw_result["content"])
+    attach_stats_to_records(records, raw_result["generation_stats"])
+    return {"used_ai": True, "records": records}
 
 
 async def generate_selected_records_one_by_one(
@@ -1884,9 +1988,9 @@ async def call_openai_compatible(
     model: str,
     prompt: str,
 ) -> dict[str, Any]:
-    content = await call_openai_compatible_raw(base_url, api_key, model, prompt)
-    answers = parse_ai_json(content)
-    return {"used_ai": True, "answers": answers}
+    raw_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
+    answers = parse_ai_json(raw_result["content"])
+    return {"used_ai": True, "answers": answers, "generation_stats": raw_result["generation_stats"]}
 
 
 def fallback_record_from_selected(record: dict[str, Any], fields: list[dict[str, Any]], index: int, reason: str) -> dict[str, Any]:
@@ -1906,6 +2010,12 @@ def fallback_record_from_selected(record: dict[str, Any], fields: list[dict[str,
 
 
 async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, prompt: str) -> str:
+    result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
+    return result["content"]
+
+
+async def call_openai_compatible_raw_with_stats(base_url: str, api_key: str, model: str, prompt: str) -> dict[str, Any]:
+    started = time.perf_counter()
     try:
         timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1939,7 +2049,21 @@ async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, pr
 
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=describe_ai_http_error(response.status_code, response.text, base_url, model))
-    return response.json()["choices"][0]["message"]["content"]
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    return {
+        "content": content,
+        "generation_stats": build_generation_stats(
+            "openai-compatible",
+            model,
+            prompt,
+            content,
+            usage,
+            time.perf_counter() - started,
+            "api" if usage else "estimated",
+        ),
+    }
 
 
 async def list_openai_compatible_models(base_url: str, api_key: str, current_model: str) -> list[str]:
@@ -1963,9 +2087,9 @@ async def list_openai_compatible_models(base_url: str, api_key: str, current_mod
 
 
 async def call_ollama(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
-    content = await call_ollama_raw(base_url, model, prompt, api_key)
-    answers = parse_ai_json(content)
-    return {"used_ai": True, "answers": answers}
+    raw_result = await call_ollama_raw_with_stats(base_url, model, prompt, api_key)
+    answers = parse_ai_json(raw_result["content"])
+    return {"used_ai": True, "answers": answers, "generation_stats": raw_result["generation_stats"]}
 
 
 def ollama_headers(api_key: str = "") -> dict[str, str]:
@@ -1973,6 +2097,12 @@ def ollama_headers(api_key: str = "") -> dict[str, str]:
 
 
 async def call_ollama_raw(base_url: str, model: str, prompt: str, api_key: str = "") -> str:
+    result = await call_ollama_raw_with_stats(base_url, model, prompt, api_key)
+    return result["content"]
+
+
+async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
+    started = time.perf_counter()
     try:
         timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -2008,7 +2138,32 @@ async def call_ollama_raw(base_url: str, model: str, prompt: str, api_key: str =
 
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=describe_ai_http_error(response.status_code, response.text, base_url, model))
-    return response.json().get("message", {}).get("content", "")
+    payload = response.json()
+    content = payload.get("message", {}).get("content", "")
+    usage = {
+        "prompt_eval_count": payload.get("prompt_eval_count"),
+        "eval_count": payload.get("eval_count"),
+        "total_tokens": payload.get("total_tokens"),
+    }
+    duration_seconds = (
+        (float(payload.get("total_duration") or 0) / 1_000_000_000)
+        or float(payload.get("duration_seconds") or 0)
+        or (time.perf_counter() - started)
+    )
+    has_usage = bool(usage.get("prompt_eval_count") or usage.get("eval_count") or usage.get("total_tokens"))
+    token_source = str(payload.get("token_source") or ("api" if has_usage else "estimated"))
+    return {
+        "content": content,
+        "generation_stats": build_generation_stats(
+            "ollama",
+            model,
+            prompt,
+            content,
+            usage,
+            duration_seconds,
+            token_source,
+        ),
+    }
 
 
 async def ensure_ollama_model(config: dict[str, str]) -> None:
