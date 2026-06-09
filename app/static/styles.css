@@ -846,6 +846,140 @@ button.mini {
   background: #98482e;
 }
 
+.generated-user-note {
+  border: 1px solid #cfe3d9;
+  border-radius: 8px;
+  background: #f6fbf8;
+  color: #12372c;
+  padding: 12px 14px;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.55;
+}
+
+.history-panel {
+  border: 1px solid #e1ebe6;
+  border-radius: 8px;
+  background: #fff;
+  padding: 16px;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.history-head h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+}
+
+.history-filter {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.history-filter input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 10px;
+  min-height: 36px;
+  font: inherit;
+}
+
+#history-status {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.history-list {
+  display: grid;
+  gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.history-item {
+  border: 1px solid #e3ece7;
+  border-radius: 8px;
+  background: #fbfefd;
+  padding: 12px;
+}
+
+.history-item.missing {
+  opacity: 0.72;
+}
+
+.history-item-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.history-item-top strong {
+  color: var(--text);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.history-item-top span,
+.history-meta,
+.history-record-titles {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.history-record-titles {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.history-download,
+.history-missing-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  border-radius: 6px;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.history-download {
+  background: var(--primary);
+  color: #fff;
+  text-decoration: none;
+}
+
+.batch-history-download {
+  background: #0f766e;
+}
+
+.history-missing-link {
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: #f8faf8;
+}
+
 .preview-panel {
   border: 1px solid var(--line);
   border-radius: 8px;

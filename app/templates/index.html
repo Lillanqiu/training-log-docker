@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI 训练日志填写</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260608-3" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260609-4" />
   </head>
   <body>
     <section id="login-screen" class="login-screen">
@@ -472,9 +472,9 @@
               <span>请检查是否有问题</span>
             </div>
             <div id="preview-list" class="preview-list"></div>
-            <div class="confirm-row">
+            <div class="confirm-row hidden" aria-hidden="true">
               <label class="checkline">
-                <input id="preview-confirmed" type="checkbox" />
+                <input id="preview-confirmed" type="checkbox" checked />
                 <span>我已检查，内容没有问题</span>
               </label>
             </div>
@@ -490,8 +490,21 @@
             <p id="batch-progress-detail">正在准备生成任务...</p>
             <button id="cancel-batch" type="button" class="secondary mini">取消生成</button>
           </section>
+          <div id="generated-user-note" class="generated-user-note hidden"></div>
           <div id="download-slot"></div>
           <div id="results" class="results empty">结果会显示在这里。</div>
+          <section class="history-panel">
+            <div class="history-head">
+              <h3>历史记录</h3>
+              <button id="history-refresh" type="button" class="secondary mini">刷新</button>
+            </div>
+            <div class="history-filter">
+              <input id="history-writer-filter" type="text" placeholder="按填写人筛选，例如：张三" />
+              <button id="history-use-writer" type="button" class="secondary mini">使用填写人</button>
+            </div>
+            <p id="history-status">正在读取历史记录...</p>
+            <div id="generation-history-list" class="history-list"></div>
+          </section>
           <section class="side-card process-card">
             <h3>处理流程</h3>
             <ol>
@@ -512,7 +525,7 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260608-3"></script>
+    <script src="/static/app.js?v=20260609-4"></script>
     <script src="/static/api-presets.js?v=20260603-12"></script>
     <script src="/static/secret-toggle.js?v=20260528-1"></script>
   </body>

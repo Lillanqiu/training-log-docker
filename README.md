@@ -73,17 +73,17 @@ git clone https://github.com/你的用户名/训练日志.git
 git clone https://github.com/你的用户名/training-log.git
 ```
 
-本项目当前仓库示例：
+仓库地址示例：
 
 ```powershell
-git clone https://github.com/Lillanqiu/training-log-docker.git
+git clone https://github.com/你的用户名/training-log-docker.git
 cd training-log-docker
 ```
 
 执行完上面两个命令后，PowerShell 提示符应该类似这样：
 
 ```text
-PS C:\Users\Skills\training-log-docker>
+PS C:\Users\你的用户名\Documents\training-log-docker>
 ```
 
 这说明你已经进入项目目录，接下来就可以继续复制配置文件并启动 Docker。
@@ -147,10 +147,10 @@ docker compose ps
 
 ### 3. 进入项目目录
 
-PowerShell 示例：
+如果你已经把项目放在本机某个目录，请进入你自己的项目路径。PowerShell 示例：
 
 ```powershell
-cd "C:\Users\lillan\OneDrive\文档\训练日志"
+cd "C:\Users\你的用户名\Documents\training-log-docker"
 ```
 
 如果你是刚刚用 `git clone` 拉下来的项目，就进入你实际 clone 出来的目录，例如：
@@ -562,6 +562,33 @@ Docker 容器内路径是：
 - 本地兜底生成：没有调用模型，token 显示为未统计。
 
 批量生成时，如果系统是一篇一篇调用模型，每篇会显示自己的耗时和 token。若使用一次模型调用生成多篇内容，后端会把这次请求的 token 和耗时按篇分摊显示。
+
+## 历史记录
+
+每次生成完成后，系统会把生成记录写入：
+
+```text
+config/generation-history.json
+```
+
+这个文件会跟随 `config/` 目录保存在本机，电脑重启或 Docker 容器重建后仍然存在。
+
+页面右侧“历史记录”里可以看到：
+
+- 生成时间。
+- 生成用户，也就是“填写人”字段。
+- 登录用户。
+- 访问来源，例如 `localhost`。
+- 使用模型和篇数。
+- 对应的下载链接。
+
+如果没有设置登录密码，系统无法真正知道是谁在使用同一个浏览器或同一个 `localhost` 页面，因此会主要按“填写人”区分历史记录。多人共用时，建议每个人都填写自己的“填写人”姓名，然后在历史记录里按姓名筛选。
+
+如果开启登录密码，历史记录会优先按登录账号隔离。`localhost` 只能辅助显示访问来源，不能可靠地区分同一台电脑上的不同真人。
+
+历史功能也会扫描 `outputs/` 目录里已有的 DOCX、PDF、ZIP 和输出文件夹；这些旧文件会显示为“历史未登记”或“找回文件”，方便找回以前生成但没有写入历史索引的文件。找回文件只提供下载，不会显示历史耗时和 token，因为旧文件本身不包含模型调用统计。
+
+历史记录里的下载按钮只是下载文件，不会新增一条生成记录。文件夹模式生成的历史记录会同时显示“批量下载全部 ZIP”和单个文件下载；生成结果默认仍保留为文件夹模式。临时打包 ZIP 会写入 `config/download-cache/`，不会再放进 `outputs/` 里被历史扫描误认为新生成文件。
 
 ## 多用户和配置保存
 

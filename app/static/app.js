@@ -17,6 +17,12 @@ const restartModelButton = document.querySelector("#restart-model");
 const unloadModelButton = document.querySelector("#unload-model");
 const apiTestStatus = document.querySelector("#api-test-status");
 const downloadSlot = document.querySelector("#download-slot");
+const generatedUserNote = document.querySelector("#generated-user-note");
+const historyList = document.querySelector("#generation-history-list");
+const historyStatus = document.querySelector("#history-status");
+const historyRefreshButton = document.querySelector("#history-refresh");
+const historyWriterFilter = document.querySelector("#history-writer-filter");
+const historyUseWriterButton = document.querySelector("#history-use-writer");
 const batchProgressPanel = document.querySelector("#batch-progress");
 const batchProgressTitle = document.querySelector("#batch-progress-title");
 const batchProgressCount = document.querySelector("#batch-progress-count");
@@ -336,6 +342,13 @@ restoreAccountFileInput?.addEventListener("change", () => {
   restoreAccountFileInput.value = "";
 });
 previewTemplateButton?.addEventListener("click", () => previewTemplate());
+historyRefreshButton?.addEventListener("click", () => loadGenerationHistory());
+historyWriterFilter?.addEventListener("change", () => loadGenerationHistory());
+historyUseWriterButton?.addEventListener("click", () => {
+  const writer = document.querySelector("#default-writer")?.value?.trim() || "";
+  historyWriterFilter.value = writer;
+  loadGenerationHistory();
+});
 
 legacyModuleChecks.forEach((check) => {
   check.closest(".module-option").remove();
@@ -499,7 +512,8 @@ form.addEventListener("submit", async (event) => {
   downloadSlot.replaceChildren();
   previewPanel.classList.add("hidden");
   previewList.replaceChildren();
-  previewConfirmed.checked = false;
+  if (previewConfirmed) previewConfirmed.checked = true;
+  generatedUserNote?.classList.add("hidden");
   copyButton.disabled = true;
   if (batchMode) {
     await runBatchJob();
@@ -621,6 +635,7 @@ function showAuthenticatedApp(user) {
     currentUserName.textContent = user?.display_name || user?.username || "已登录";
   }
   loadAuthSettings();
+  loadGenerationHistory();
   window.requestAnimationFrame(restoreWorkspaceLeftWidth);
 }
 
@@ -1549,7 +1564,9 @@ gpuModelInput?.addEventListener("change", updateApiSummary);
 function renderResults(payload) {
   statusPill.textContent = payload.used_ai ? "AI 已启用" : "本地兜底";
   renderPreview(payload);
+  renderGeneratedUserNote(payload);
   renderDownload(payload.download_url, payload.folder_path, payload.folder_files, payload.folder_zip_url);
+  loadGenerationHistory();
   results.className = "results";
   if (payload.batch && Array.isArray(payload.records)) {
     renderBatchResults(payload.records);
@@ -1590,7 +1607,7 @@ function renderResults(payload) {
   );
 }
 
-previewConfirmed.addEventListener("change", () => {
+previewConfirmed?.addEventListener("change", () => {
   const links = downloadSlot.querySelectorAll("a");
   links.forEach((link) => {
     link.classList.toggle("disabled-link", !previewConfirmed.checked);
@@ -1956,6 +1973,135 @@ function renderBatchResults(records) {
   );
 }
 
+function renderGeneratedUserNote(payload) {
+  if (!generatedUserNote) return;
+  const generatedUser = String(payload?.generated_user || "").trim();
+  if (!generatedUser) {
+    generatedUserNote.classList.add("hidden");
+    generatedUserNote.textContent = "";
+    return;
+  }
+  generatedUserNote.classList.remove("hidden");
+  generatedUserNote.textContent = `生成用户：${generatedUser}。本次记录已写入历史记录，可在电脑重启后继续查找下载。`;
+}
+
+async function loadGenerationHistory() {
+  if (!historyList || !historyStatus) return;
+  const writer = historyWriterFilter?.value?.trim() || "";
+  historyStatus.className = "";
+  historyStatus.textContent = "正在读取历史记录...";
+  try {
+    const query = new URLSearchParams({ limit: "80" });
+    if (writer) query.set("writer", writer);
+    const response = await fetch(`/api/history?${query.toString()}`);
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "读取历史记录失败");
+    }
+    renderGenerationHistory(payload.items || [], payload);
+  } catch (error) {
+    historyList.replaceChildren();
+    historyStatus.className = "error-text";
+    historyStatus.textContent = humanFetchError(error);
+  }
+}
+
+function renderGenerationHistory(items, payload = {}) {
+  historyList.replaceChildren();
+  if (!items.length) {
+    historyStatus.className = "";
+    historyStatus.textContent = historyWriterFilter?.value?.trim()
+      ? "没有找到这个填写人的历史记录。"
+      : "还没有历史记录。生成完成后会自动出现在这里。";
+    return;
+  }
+  const modeTip = payload.auth_required
+    ? "当前按登录账号显示历史记录。"
+    : "免密码模式下，历史记录按“填写人”区分；多人同机使用时请填写不同姓名。";
+  historyStatus.className = "";
+  historyStatus.textContent = `已读取 ${items.length} 条历史。${modeTip}`;
+  historyList.replaceChildren(...items.map(createHistoryItemNode));
+}
+
+function createHistoryItemNode(item) {
+  const card = document.createElement("article");
+  card.className = "history-item";
+  if (!item.available) card.classList.add("missing");
+
+  const top = document.createElement("div");
+  top.className = "history-item-top";
+  const title = document.createElement("strong");
+  title.textContent = item.title || "训练日志";
+  const time = document.createElement("span");
+  time.textContent = formatHistoryTime(item.created_at);
+  top.append(title, time);
+
+  const meta = document.createElement("div");
+  meta.className = "history-meta";
+  const stats = item.stats || {};
+  const recovered = Boolean(item.recovered) || String(item.id || "").startsWith("discovered-");
+  const tokenText = Number(stats.total_tokens || 0) ? `Token ${stats.total_tokens}` : "Token 未统计";
+  const durationText = Number(stats.duration_seconds || 0) ? `耗时 ${Number(stats.duration_seconds).toFixed(1)} 秒` : "耗时未统计";
+  meta.textContent = [
+    `生成用户：${item.generated_user || "未填写"}`,
+    `篇数：${item.record_count || 1}`,
+    item.model ? `模型：${item.model}` : "",
+    `来源：${item.source_label || "本机"}`,
+    recovered ? "找回文件：仅可下载，不含历史耗时和 Token" : durationText,
+    recovered ? "" : tokenText,
+  ].filter(Boolean).join(" / ");
+
+  const titles = document.createElement("div");
+  titles.className = "history-record-titles";
+  titles.textContent = Array.isArray(item.record_titles) && item.record_titles.length
+    ? item.record_titles.slice(0, 4).join("；")
+    : "";
+
+  const actions = document.createElement("div");
+  actions.className = "history-actions";
+  const downloads = Array.isArray(item.downloads) ? item.downloads : [];
+  if (downloads.length) {
+    downloads.slice(0, 8).forEach((download) => {
+      if (download.available === false) {
+        const missing = document.createElement("span");
+        missing.className = "history-missing-link";
+        missing.textContent = `${download.label || "文件"}已不存在`;
+        actions.append(missing);
+        return;
+      }
+      const link = document.createElement("a");
+      link.href = download.url;
+      link.textContent = download.label || "下载";
+      link.className = "history-download";
+      if (download.kind === "folder_zip") link.classList.add("batch-history-download");
+      actions.append(link);
+    });
+  } else {
+    const none = document.createElement("span");
+    none.className = "history-missing-link";
+    none.textContent = "没有可下载文件";
+    actions.append(none);
+  }
+
+  card.append(top, meta);
+  if (titles.textContent) card.append(titles);
+  card.append(actions);
+  return card;
+}
+
+function formatHistoryTime(value) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZipUrl = "") {
   downloadSlot.replaceChildren();
   if (folderPath) {
@@ -1963,35 +2109,15 @@ function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZi
     message.className = "download-link folder-output";
     message.textContent = `文件夹已生成：${folderPath}`;
     downloadSlot.append(message);
-    const effectiveFolderZipUrl = folderZipUrl || folderZipUrlFromPath(folderPath);
-    if (effectiveFolderZipUrl) {
-      const zipLink = document.createElement("a");
-      zipLink.className = "download-link batch-download disabled-link";
-      zipLink.href = effectiveFolderZipUrl;
-      zipLink.textContent = "批量下载全部 ZIP";
-      zipLink.addEventListener("click", (event) => {
-        if (!previewConfirmed.checked) {
-          event.preventDefault();
-          alert("请先勾选“我已检查，内容没有问题”再下载。");
-        }
-      });
-      downloadSlot.append(zipLink);
-    }
     if (Array.isArray(folderFiles) && folderFiles.length) {
       const list = document.createElement("div");
       list.className = "folder-file-list";
       folderFiles.forEach((file) => {
         if (!file?.download_url || !file?.name) return;
         const link = document.createElement("a");
-        link.className = "download-link disabled-link";
+        link.className = "download-link";
         link.href = file.download_url;
         link.textContent = `下载 ${file.name}`;
-        link.addEventListener("click", (event) => {
-          if (!previewConfirmed.checked) {
-            event.preventDefault();
-            alert("请先勾选“我已检查，内容没有问题”再下载。");
-          }
-        });
         list.append(link);
       });
       downloadSlot.append(list);
@@ -2000,7 +2126,7 @@ function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZi
   }
   if (!downloadUrl) return;
   const link = document.createElement("a");
-  link.className = "download-link disabled-link";
+  link.className = "download-link";
   link.href = downloadUrl;
   const suffix = downloadUrl.toLowerCase().split("?")[0].split(".").pop();
   if (suffix === "zip") {
@@ -2008,19 +2134,7 @@ function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZi
   } else {
     link.textContent = suffix === "pdf" ? "下载已填写 PDF" : "下载已填写 DOCX";
   }
-  link.setAttribute("aria-disabled", "true");
-  link.addEventListener("click", (event) => {
-    if (!previewConfirmed.checked) {
-      event.preventDefault();
-      previewPanel.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-  });
   downloadSlot.append(link);
-}
-
-function folderZipUrlFromPath(folderPath) {
-  const folderName = String(folderPath || "").split(/[\\/]/).filter(Boolean).pop();
-  return folderName ? `/download-folder-zip/${encodeURIComponent(folderName)}` : "";
 }
 
 function renderPreview(payload) {

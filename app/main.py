@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 from openpyxl import load_workbook
@@ -33,9 +34,12 @@ CONFIG_DIR = Path("/app/config")
 CONFIG_PATH = CONFIG_DIR / "api-config.json"
 USERS_PATH = CONFIG_DIR / "users.json"
 AUTH_SETTINGS_PATH = CONFIG_DIR / "auth-settings.json"
+HISTORY_PATH = CONFIG_DIR / "generation-history.json"
+DOWNLOAD_CACHE_DIR = CONFIG_DIR / "download-cache"
 DEFAULT_TEMPLATE_PATH = BASE_DIR / "templates_docx" / "default-training-log.docx"
 MAX_TEXT_CHARS = 18000
 MAX_REQUIREMENTS_CHARS = 10000
+HISTORY_LIMIT = 500
 SESSION_COOKIE = "training_log_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
 JOBS: dict[str, dict[str, Any]] = {}
@@ -110,6 +114,31 @@ async def save_auth_settings(payload: dict[str, bool], request: Request) -> dict
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     AUTH_SETTINGS_PATH.write_text(json.dumps({"require_password": require_password}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"require_password": require_password}
+
+
+@app.get("/api/history")
+async def list_generation_history(request: Request, writer: str = "", limit: int = 80) -> dict[str, Any]:
+    user = require_current_user(request)
+    normalized_writer = writer.strip().lower()
+    safe_limit = max(1, min(int(limit or 80), 200))
+    raw_entries = load_generation_history()
+    entries = [
+        enrich_history_entry(entry)
+        for entry in raw_entries + discover_output_history(raw_entries)
+        if can_view_history_entry(entry, user)
+    ]
+    if normalized_writer:
+        entries = [
+            entry for entry in entries
+            if normalized_writer in str(entry.get("generated_user") or "").lower()
+        ]
+    entries.sort(key=history_sort_key, reverse=True)
+    return {
+        "items": entries[:safe_limit],
+        "total": len(entries),
+        "auth_required": is_auth_required(),
+        "current_user": public_user(user),
+    }
 
 
 @app.get("/api/config")
@@ -329,7 +358,7 @@ async def create_fill_job(
     api_key: str = Form(""),
     api_model: str = Form(""),
 ) -> dict[str, Any]:
-    require_current_user(request)
+    user = require_current_user(request)
     saved_path, original_filename = await resolve_template_file(file)
     document_text = extract_text(saved_path, original_filename)
     fields = parse_form_schema(form_schema)
@@ -385,6 +414,8 @@ async def create_fill_job(
             custom_skills,
             output_format,
             output_package_mode,
+            user,
+            request_history_context(request),
         )
     )
     return job_snapshot(job_id)
@@ -648,7 +679,7 @@ async def fill_form(
             if output_path.is_dir():
                 folder_path = output_folder_display_path(output_path)
                 folder_files = output_folder_file_links(output_path)
-                folder_zip_url = output_folder_zip_url(output_path)
+                folder_zip_url = ""
             else:
                 download_url = f"/download/{output_path.name}"
                 folder_files = []
@@ -656,7 +687,7 @@ async def fill_form(
         else:
             folder_files = []
             folder_zip_url = ""
-        return {
+        payload = {
             "filename": original_filename,
             "used_ai": batch_result["used_ai"],
             "batch": True,
@@ -669,6 +700,21 @@ async def fill_form(
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
         }
+        entry = append_generation_history(
+            build_history_entry(
+                request,
+                user,
+                payload,
+                default_writer,
+                api_config,
+                output_format,
+                output_package_mode,
+                original_filename,
+            )
+        )
+        payload["history_id"] = entry["id"]
+        payload["generated_user"] = entry["generated_user"]
+        return payload
 
     if manual_module.strip() or manual_training_content.strip() or start_date.strip() or default_coach.strip() or default_writer.strip():
         manual_plan = manual_training_content.strip() or manual_module.strip() or "手动填写训练内容"
@@ -701,7 +747,7 @@ async def fill_form(
         output_path = convert_output_format(output_path, output_format)
         download_url = f"/download/{output_path.name}"
 
-    return {
+    payload = {
         "filename": original_filename,
         "used_ai": result["used_ai"],
         "batch": False,
@@ -711,6 +757,21 @@ async def fill_form(
         "source_preview": document_text[:1200],
         "requirements_preview": requirements_text[:1200],
     }
+    entry = append_generation_history(
+        build_history_entry(
+            request,
+            user,
+            payload,
+            default_writer,
+            api_config,
+            output_format,
+            output_package_mode,
+            original_filename,
+        )
+    )
+    payload["history_id"] = entry["id"]
+    payload["generated_user"] = entry["generated_user"]
+    return payload
 
 
 @app.post("/api/import-plan")
@@ -980,6 +1041,363 @@ def safe_config_name(value: str) -> str:
     return safe or "user"
 
 
+def load_generation_history() -> list[dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def save_generation_history(items: list[dict[str, Any]]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = HISTORY_PATH.with_suffix(".tmp")
+    tmp_path.write_text(
+        json.dumps({"version": 1, "items": items[:HISTORY_LIMIT]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(HISTORY_PATH)
+
+
+def append_generation_history(entry: dict[str, Any]) -> dict[str, Any]:
+    history = [entry] + [item for item in load_generation_history() if item.get("id") != entry.get("id")]
+    save_generation_history(history)
+    return entry
+
+
+def request_history_context(request: Request) -> dict[str, str]:
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    client_host = forwarded_for or (request.client.host if request.client else "")
+    page_host = request.headers.get("host", "")
+    return {
+        "client_host": client_host,
+        "page_host": page_host,
+        "source_label": source_label_from_hosts(client_host, page_host),
+    }
+
+
+def source_label_from_hosts(client_host: str, page_host: str) -> str:
+    host = (page_host or client_host or "").strip()
+    if host.startswith("127.0.0.1") or host.startswith("localhost"):
+        return "localhost"
+    return host or "本机"
+
+
+def build_history_entry(
+    request: Request,
+    user: dict[str, str],
+    payload: dict[str, Any],
+    default_writer: str,
+    api_config: dict[str, str],
+    output_format: str,
+    output_package_mode: str,
+    original_filename: str,
+) -> dict[str, Any]:
+    return build_history_entry_from_context(
+        request_history_context(request),
+        user,
+        payload,
+        default_writer,
+        api_config,
+        output_format,
+        output_package_mode,
+        original_filename,
+    )
+
+
+def build_history_entry_from_context(
+    request_context: dict[str, str],
+    user: dict[str, str],
+    payload: dict[str, Any],
+    default_writer: str,
+    api_config: dict[str, str],
+    output_format: str,
+    output_package_mode: str,
+    original_filename: str,
+) -> dict[str, Any]:
+    records = payload_records_for_history(payload)
+    generated_user = generated_user_name(default_writer, records, payload, user)
+    title = payload_history_title(payload, records, original_filename)
+    downloads = history_downloads(payload)
+    return {
+        "id": uuid.uuid4().hex,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "title": title,
+        "generated_user": generated_user,
+        "login_user": user.get("username", "guest"),
+        "login_display_name": user.get("display_name") or user.get("username", "guest"),
+        "auth_required": is_auth_required(),
+        "source_label": request_context.get("source_label", "本机"),
+        "client_host": request_context.get("client_host", ""),
+        "page_host": request_context.get("page_host", ""),
+        "batch": bool(payload.get("batch")),
+        "partial": bool(payload.get("partial")),
+        "record_count": len(records) if records else (len(payload.get("records", [])) if isinstance(payload.get("records"), list) else 1),
+        "template_filename": original_filename,
+        "used_ai": bool(payload.get("used_ai")),
+        "api_format": api_config.get("format", ""),
+        "model": api_config.get("model", ""),
+        "output_format": output_format,
+        "package_mode": output_package_mode,
+        "downloads": downloads,
+        "download_url": payload.get("download_url", ""),
+        "folder_path": payload.get("folder_path", ""),
+        "folder_zip_url": payload.get("folder_zip_url", ""),
+        "record_titles": history_record_titles(records),
+        "stats": summarize_history_stats(payload, records),
+    }
+
+
+def payload_records_for_history(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records = payload.get("records")
+    if isinstance(records, list) and records:
+        return [record for record in records if isinstance(record, dict)]
+    answers = payload.get("answers") if isinstance(payload.get("answers"), list) else []
+    return [{"title": payload.get("filename") or "训练日志", "answers": answers, "generation_stats": payload.get("generation_stats")}]
+
+
+def generated_user_name(default_writer: str, records: list[dict[str, Any]], payload: dict[str, Any], user: dict[str, str]) -> str:
+    candidates = [
+        default_writer,
+        str(payload.get("generated_user") or ""),
+        *(answer_list_value(record.get("answers", []), ["填写人", "生成用户", "姓名"]) for record in records),
+        user.get("display_name", ""),
+        user.get("username", ""),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return "未填写姓名"
+
+
+def payload_history_title(payload: dict[str, Any], records: list[dict[str, Any]], original_filename: str) -> str:
+    if payload.get("batch"):
+        return package_title_for_records(records) if records else "批量训练日志"
+    answers = records[0].get("answers", []) if records else []
+    return title_from_answers(answers, original_filename) or "训练日志"
+
+
+def history_record_titles(records: list[dict[str, Any]]) -> list[str]:
+    titles = []
+    for index, record in enumerate(records[:12], start=1):
+        title = str(record.get("title") or "").strip() or title_from_answers(record.get("answers", []), f"第 {index} 篇")
+        titles.append(title)
+    return titles
+
+
+def summarize_history_stats(payload: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+    stats_items: list[dict[str, Any]] = []
+    if isinstance(payload.get("generation_stats"), dict):
+        stats_items.append(payload["generation_stats"])
+    for record in records:
+        stats = record.get("generation_stats")
+        if isinstance(stats, dict):
+            stats_items.append(stats)
+    if not stats_items:
+        return {"duration_seconds": 0, "total_tokens": 0}
+    return {
+        "duration_seconds": round(sum(float(item.get("duration_seconds") or 0) for item in stats_items), 2),
+        "total_tokens": sum(int(item.get("total_tokens") or 0) for item in stats_items),
+        "token_source": stats_items[0].get("token_source", ""),
+    }
+
+
+def history_downloads(payload: dict[str, Any]) -> list[dict[str, str]]:
+    downloads: list[dict[str, str]] = []
+    if payload.get("download_url"):
+        downloads.append({"label": "下载文件", "url": str(payload["download_url"])})
+    if payload.get("folder_zip_url") and not payload.get("folder_path"):
+        downloads.append({"label": "下载全部 ZIP", "url": str(payload["folder_zip_url"])})
+    for file in payload.get("folder_files") or []:
+        if isinstance(file, dict) and file.get("download_url") and file.get("name"):
+            downloads.append({"label": str(file["name"]), "url": str(file["download_url"])})
+    return downloads
+
+
+def can_view_history_entry(entry: dict[str, Any], user: dict[str, str]) -> bool:
+    if str(entry.get("id") or "").startswith("discovered-"):
+        return True
+    if not is_auth_required():
+        return True
+    return str(entry.get("login_user") or "") == user.get("username")
+
+
+def history_sort_key(entry: dict[str, Any]) -> tuple[int, str]:
+    is_registered = 0 if str(entry.get("id") or "").startswith("discovered-") else 1
+    return (is_registered, str(entry.get("created_at") or ""))
+
+
+def enrich_history_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(entry)
+    downloads = []
+    folder_zip_download = history_folder_zip_download(entry)
+    if folder_zip_download:
+        folder_zip_download["available"] = output_url_exists(folder_zip_download["url"])
+        downloads.append(folder_zip_download)
+    for download in entry.get("downloads") or []:
+        if not isinstance(download, dict):
+            continue
+        item = dict(download)
+        if folder_zip_download and str(item.get("url") or "") == folder_zip_download["url"]:
+            continue
+        item["available"] = output_url_exists(str(item.get("url") or ""))
+        downloads.append(item)
+    enriched["downloads"] = downloads
+    enriched["available"] = any(item.get("available") for item in downloads) or output_folder_path_exists(str(entry.get("folder_path") or ""))
+    return enriched
+
+
+def history_folder_zip_download(entry: dict[str, Any]) -> dict[str, str] | None:
+    folder_path = str(entry.get("folder_path") or "").strip()
+    folder_name = folder_path.replace("\\", "/").rstrip("/").split("/")[-1]
+    if not folder_name:
+        return None
+    return {
+        "label": "批量下载全部 ZIP",
+        "url": f"/download-folder-zip/{folder_name}",
+        "kind": "folder_zip",
+    }
+
+
+def output_folder_path_exists(folder_path: str) -> bool:
+    folder_name = folder_path.replace("\\", "/").rstrip("/").split("/")[-1]
+    if not folder_name:
+        return False
+    target = (OUTPUT_DIR / folder_name).resolve()
+    root = OUTPUT_DIR.resolve()
+    return (target == root or root in target.parents) and target.exists()
+
+
+def output_url_exists(url: str) -> bool:
+    parts = [unquote(part) for part in url.split("?", 1)[0].strip("/").split("/") if part]
+    if len(parts) == 2 and parts[0] == "download":
+        return output_child_exists(parts[1])
+    if len(parts) == 2 and parts[0] == "download-folder-zip":
+        return output_child_exists(parts[1], expect_dir=True)
+    if len(parts) == 3 and parts[0] == "download-folder":
+        return output_child_exists(parts[1], parts[2])
+    return False
+
+
+def output_child_exists(*parts: str, expect_dir: bool = False) -> bool:
+    root = OUTPUT_DIR.resolve()
+    target = root.joinpath(*parts).resolve()
+    if root not in target.parents and target != root:
+        return False
+    return target.is_dir() if expect_dir else target.is_file()
+
+
+def discover_output_history(existing_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not OUTPUT_DIR.exists():
+        return []
+    known_urls = {
+        str(download.get("url") or "")
+        for entry in existing_entries
+        for download in (entry.get("downloads") or [])
+        if isinstance(download, dict)
+    }
+    registered_folder_file_names = registered_history_folder_file_names(existing_entries)
+    folder_file_names = output_folder_file_names()
+    discovered: list[dict[str, Any]] = []
+    for child in sorted(OUTPUT_DIR.iterdir(), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
+        if child.is_file() and child.suffix.lower() in {".docx", ".pdf", ".zip"}:
+            url = f"/download/{child.name}"
+            if url in known_urls:
+                continue
+            if is_download_cache_zip_name(child.name):
+                continue
+            display_name = download_display_name(child)
+            if display_name in registered_folder_file_names or display_name in folder_file_names:
+                continue
+            discovered.append(discovered_output_entry(child, [{"label": "下载文件", "url": url}], 1))
+        elif child.is_dir():
+            files = output_folder_file_links(child)
+            if not files:
+                continue
+            if any(file["download_url"] in known_urls for file in files):
+                continue
+            downloads = [
+                {"label": file["name"], "url": file["download_url"]}
+                for file in files[:8]
+            ]
+            discovered.append(discovered_output_entry(child, downloads, len(files)))
+    return discovered[:120]
+
+
+def registered_history_folder_file_names(entries: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for entry in entries:
+        if not entry.get("folder_path"):
+            continue
+        for download in entry.get("downloads") or []:
+            if not isinstance(download, dict):
+                continue
+            url = str(download.get("url") or "")
+            parts = [unquote(part) for part in url.split("?", 1)[0].strip("/").split("/") if part]
+            if len(parts) == 3 and parts[0] == "download-folder":
+                names.add(parts[2])
+    return names
+
+
+def output_folder_file_names() -> set[str]:
+    names: set[str] = set()
+    for child in OUTPUT_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        for file in output_folder_file_links(child):
+            if file.get("name"):
+                names.add(file["name"])
+    return names
+
+
+def is_download_cache_zip_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-f0-9]{32}-[a-f0-9]{32}-.+\.zip", name))
+
+
+def discovered_output_entry(path: Path, downloads: list[dict[str, str]], count: int) -> dict[str, Any]:
+    created_at = datetime.utcfromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") + "Z"
+    display_name = download_display_name(path) if path.is_file() else display_output_name(path.name)
+    return {
+        "id": f"discovered-{hashlib.sha1(str(path).encode('utf-8')).hexdigest()[:16]}",
+        "created_at": created_at,
+        "title": display_name,
+        "generated_user": "历史未登记",
+        "login_user": "guest",
+        "login_display_name": "历史未登记",
+        "auth_required": False,
+        "source_label": "outputs",
+        "client_host": "",
+        "page_host": "",
+        "batch": path.is_dir() or count > 1,
+        "partial": False,
+        "record_count": count,
+        "template_filename": "",
+        "used_ai": False,
+        "api_format": "",
+        "model": "",
+        "output_format": path.suffix.lower().lstrip(".") if path.is_file() else "",
+        "package_mode": "folder" if path.is_dir() else "",
+        "downloads": downloads,
+        "download_url": downloads[0]["url"] if downloads else "",
+        "folder_path": output_folder_display_path(path) if path.is_dir() else "",
+        "folder_zip_url": "",
+        "record_titles": [],
+        "stats": {"duration_seconds": 0, "total_tokens": 0},
+        "recovered": True,
+    }
+
+
+def display_output_name(name: str) -> str:
+    match = re.fullmatch(r"[a-f0-9]{32}-(.+)", name)
+    return match.group(1) if match else name
+
+
 def normalize_docker_host_url(url: str) -> str:
     return re.sub(r"^(https?://)(localhost|127\.0\.0\.1)(:\d+)?", r"\1host.docker.internal\3", url, flags=re.IGNORECASE)
 
@@ -1122,6 +1540,8 @@ async def run_fill_job(
     custom_skills: str,
     output_format: str,
     output_package_mode: str,
+    user: dict[str, str],
+    request_context: dict[str, str],
 ) -> None:
     job = JOBS[job_id]
     generated_paths: list[tuple[Path, str]] = []
@@ -1181,10 +1601,24 @@ async def run_fill_job(
             "download_url": "" if package_path.is_dir() else f"/download/{package_path.name}",
             "folder_path": output_folder_display_path(package_path) if package_path.is_dir() else "",
             "folder_files": output_folder_file_links(package_path) if package_path.is_dir() else [],
-            "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
+            "folder_zip_url": "",
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
         }
+        entry = append_generation_history(
+            build_history_entry_from_context(
+                request_context,
+                user,
+                job["result"],
+                defaults.get("default_writer", ""),
+                api_config,
+                output_format,
+                output_package_mode,
+                original_filename,
+            )
+        )
+        job["result"]["history_id"] = entry["id"]
+        job["result"]["generated_user"] = entry["generated_user"]
     except asyncio.CancelledError:
         job["status"] = "canceled"
         job["message"] = "已取消批量生成。"
@@ -1201,6 +1635,11 @@ async def run_fill_job(
             used_ai,
             document_text,
             requirements_text,
+            user,
+            request_context,
+            defaults.get("default_writer", ""),
+            api_config,
+            output_format,
         )
     except Exception as exc:
         job["status"] = "failed"
@@ -1215,6 +1654,11 @@ async def run_fill_job(
             used_ai,
             document_text,
             requirements_text,
+            user,
+            request_context,
+            defaults.get("default_writer", ""),
+            api_config,
+            output_format,
         )
 
 
@@ -1227,6 +1671,11 @@ def attach_partial_batch_result(
     used_ai: bool,
     document_text: str,
     requirements_text: str,
+    user: dict[str, str],
+    request_context: dict[str, str],
+    default_writer: str,
+    api_config: dict[str, str],
+    output_format: str,
 ) -> None:
     if not generated_paths or not generated_records:
         return
@@ -1241,10 +1690,24 @@ def attach_partial_batch_result(
         "download_url": "" if package_path.is_dir() else f"/download/{package_path.name}",
         "folder_path": output_folder_display_path(package_path) if package_path.is_dir() else "",
         "folder_files": output_folder_file_links(package_path) if package_path.is_dir() else [],
-        "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
+        "folder_zip_url": "",
         "source_preview": document_text[:1200],
         "requirements_preview": requirements_text[:1200],
     }
+    entry = append_generation_history(
+        build_history_entry_from_context(
+            request_context,
+            user,
+            job["partial_result"],
+            default_writer,
+            api_config,
+            output_format,
+            output_package_mode,
+            original_filename,
+        )
+    )
+    job["partial_result"]["history_id"] = entry["id"]
+    job["partial_result"]["generated_user"] = entry["generated_user"]
     job["message"] = f"{job.get('message') or '批量生成失败'} 已导出 {len(generated_records)} 个已完成文件。"
 
 
@@ -1255,6 +1718,7 @@ def write_generated_package(generated_paths: list[tuple[Path, str]], records: li
         folder_path.mkdir(parents=True, exist_ok=False)
         for path, file_name in generated_paths:
             shutil.copy2(path, folder_path / file_name)
+        cleanup_packaged_temp_outputs([path for path, _ in generated_paths])
         return folder_path
 
     zip_path = OUTPUT_DIR / f"{uuid.uuid4().hex}-{root_folder}.zip"
@@ -1262,6 +1726,7 @@ def write_generated_package(generated_paths: list[tuple[Path, str]], records: li
         for path, file_name in generated_paths:
             arcname = f"{root_folder}/{file_name}"
             archive.write(path, arcname=arcname)
+    cleanup_packaged_temp_outputs([path for path, _ in generated_paths])
     return zip_path
 
 
@@ -1309,11 +1774,24 @@ def zip_output_folder(folder_path: Path) -> Path:
     ]
     if not files:
         raise HTTPException(status_code=404, detail="File not found.")
-    zip_path = OUTPUT_DIR / f"{uuid.uuid4().hex}-{safe_filename(folder_path.name)}.zip"
+    prune_download_cache()
+    DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = DOWNLOAD_CACHE_DIR / f"{uuid.uuid4().hex}-{safe_filename(folder_path.name)}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for child in files:
             archive.write(child, arcname=f"{folder_path.name}/{child.name}")
     return zip_path
+
+
+def prune_download_cache(max_age_seconds: int = 60 * 60 * 24) -> None:
+    if not DOWNLOAD_CACHE_DIR.exists():
+        return
+    now = time.time()
+    for child in DOWNLOAD_CACHE_DIR.iterdir():
+        if not child.is_file() or child.suffix.lower() != ".zip":
+            continue
+        if now - child.stat().st_mtime > max_age_seconds:
+            child.unlink(missing_ok=True)
 
 
 def output_folder_file_links(path: Path) -> list[dict[str, str]]:
@@ -2738,6 +3216,7 @@ def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], ou
         folder_path.mkdir(parents=True, exist_ok=False)
         for path, file_name in generated_paths:
             shutil.copy2(path, folder_path / file_name)
+        cleanup_packaged_temp_outputs([path for path, _ in generated_paths])
         return folder_path
 
     zip_path = OUTPUT_DIR / f"{uuid.uuid4().hex}-{root_folder}.zip"
@@ -2745,6 +3224,7 @@ def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], ou
         for path, file_name in generated_paths:
             arcname = f"{root_folder}/{file_name}"
             archive.write(path, arcname=arcname)
+    cleanup_packaged_temp_outputs([path for path, _ in generated_paths])
     return zip_path
 
 
@@ -2758,6 +3238,23 @@ def unique_package_filename(file_name: str, used_names: set[str]) -> str:
         counter += 1
     used_names.add(candidate)
     return candidate
+
+
+def cleanup_packaged_temp_outputs(paths: list[Path]) -> None:
+    for path in paths:
+        for candidate in {path, path.with_suffix(".docx")}:
+            delete_output_child_if_safe(candidate)
+
+
+def delete_output_child_if_safe(path: Path) -> None:
+    try:
+        root = OUTPUT_DIR.resolve()
+        target = path.resolve()
+    except OSError:
+        return
+    if root not in target.parents or not target.is_file():
+        return
+    target.unlink(missing_ok=True)
 
 
 def fill_docx_records(template_path: Path, records: list[dict[str, Any]]) -> Path:
@@ -3073,37 +3570,97 @@ def fill_horizontal_table(table: Any, answer_map: dict[str, str], used_cells: se
         target_row = table.add_row()
 
     for index, header in matched_indexes:
-        if index < len(target_row.cells) and id(target_row.cells[index]) not in used_cells:
+        if index < len(target_row.cells) and cell_key(target_row.cells[index]) not in used_cells:
             set_cell_text(target_row.cells[index], answer_map[header])
-            used_cells.add(id(target_row.cells[index]))
+            used_cells.add(cell_key(target_row.cells[index]))
     return True
 
 
 def fill_label_value_row(cells: list[_Cell], texts: list[str], answer_map: dict[str, str], used_cells: set[int]) -> None:
-    for index, text in enumerate(texts[:-1]):
-        value = answer_map.get(text)
-        target = cells[index + 1]
-        if value and not texts[index + 1] and id(target) not in used_cells:
-            set_cell_text(target, value)
-            used_cells.add(id(target))
+    for index, text in enumerate(texts):
+        label = answer_label_for_cell_text(text, answer_map)
+        if not label:
+            continue
+        target_index = next_distinct_value_cell_index(cells, texts, index, answer_map)
+        if target_index is None:
+            continue
+        target = cells[target_index]
+        key = cell_key(target)
+        if key in used_cells:
+            continue
+        set_cell_text(target, answer_map[label])
+        used_cells.add(key)
 
 
 def fill_section_row(cells: list[_Cell], texts: list[str], answer_map: dict[str, str], used_cells: set[int]) -> None:
-    if not texts:
-        return
-    label = texts[0]
-    value = answer_map.get(label)
-    if not value or len(cells) < 2:
-        return
-    target = cells[1]
-    if id(target) in used_cells:
-        return
-    set_cell_text(target, value)
-    used_cells.add(id(target))
+    for index, text in enumerate(texts):
+        label = answer_label_for_cell_text(text, answer_map)
+        if not label:
+            continue
+        target_index = next_distinct_value_cell_index(cells, texts, index, answer_map)
+        if target_index is None:
+            if label != text and is_placeholder_cell_text(text.removeprefix(label)):
+                target = cells[index]
+                key = cell_key(target)
+                if key not in used_cells:
+                    set_cell_text(target, f"{label}\n{answer_map[label]}")
+                    used_cells.add(key)
+            continue
+        target = cells[target_index]
+        key = cell_key(target)
+        if key in used_cells:
+            continue
+        set_cell_text(target, answer_map[label])
+        used_cells.add(key)
 
 
 def set_cell_text(cell: _Cell, value: str) -> None:
     cell.text = value
+
+
+def cell_key(cell: _Cell) -> int:
+    return id(cell._tc)
+
+
+def answer_label_for_cell_text(text: str, answer_map: dict[str, str]) -> str:
+    if text in answer_map and answer_map[text]:
+        return text
+    for label in sorted(answer_map, key=len, reverse=True):
+        value = answer_map.get(label)
+        if not value or not text.startswith(label):
+            continue
+        suffix = text[len(label):]
+        if is_placeholder_cell_text(suffix):
+            return label
+    return ""
+
+
+def next_distinct_value_cell_index(
+    cells: list[_Cell],
+    texts: list[str],
+    label_index: int,
+    answer_map: dict[str, str],
+) -> int | None:
+    label_cell_key = cell_key(cells[label_index])
+    for index in range(label_index + 1, len(cells)):
+        if cell_key(cells[index]) == label_cell_key:
+            continue
+        if texts[index] in answer_map:
+            return None
+        return index
+    return None
+
+
+def is_placeholder_cell_text(text: str) -> bool:
+    compact = clean_cell_text(text)
+    if not compact:
+        return True
+    if re.fullmatch(r"(?:\d+[.)、]?)+[.。．…·-]*", compact):
+        return True
+    if re.fullmatch(r"[.。．…·\-—_]+", compact):
+        return True
+    summary_scaffold = {"训练目标达成情况不足之处改进建议"}
+    return compact in summary_scaffold
 
 
 def normalize_output_value(value: Any) -> str:
