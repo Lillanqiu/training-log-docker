@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI 训练日志填写</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260609-4" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260612-2" />
   </head>
   <body>
     <section id="login-screen" class="login-screen">
@@ -409,6 +409,7 @@
               <button id="new-prompt-preset" type="button" class="secondary mini">新建提示词</button>
               <button id="save-prompt-preset" type="button" class="secondary mini">保存提示词</button>
               <button id="delete-prompt-preset" type="button" class="secondary mini">删除提示词</button>
+              <button id="set-default-prompt-preset" type="button" class="secondary mini">设为默认</button>
               <span id="prompt-preset-status"></span>
             </div>
           </section>
@@ -427,6 +428,7 @@
               <button id="new-skills-preset" type="button" class="secondary mini">新建 Skills</button>
               <button id="save-skills-preset" type="button" class="secondary mini">保存 Skills</button>
               <button id="delete-skills-preset" type="button" class="secondary mini">删除 Skills</button>
+              <button id="set-default-skills-preset" type="button" class="secondary mini">设为默认</button>
               <span id="skills-preset-status"></span>
             </div>
           </section>
@@ -463,8 +465,8 @@
 
         <section class="panel result-panel">
           <div class="result-head">
-            <h2>填写结果</h2>
-            <span id="ai-status">等待上传</span>
+            <h2>生成结果状态</h2>
+            <span id="ai-status">等待生成</span>
           </div>
           <section id="preview-panel" class="preview-panel hidden">
             <div class="preview-head">
@@ -490,12 +492,20 @@
             <p id="batch-progress-detail">正在准备生成任务...</p>
             <button id="cancel-batch" type="button" class="secondary mini">取消生成</button>
           </section>
+          <section id="resume-panel" class="resume-panel hidden">
+            <div class="resume-head">
+              <h3>未完成批量任务</h3>
+              <button id="resume-refresh" type="button" class="secondary mini">刷新</button>
+            </div>
+            <p id="resume-status">正在检查未完成任务...</p>
+            <div id="resume-job-list" class="resume-job-list"></div>
+          </section>
           <div id="generated-user-note" class="generated-user-note hidden"></div>
           <div id="download-slot"></div>
           <div id="results" class="results empty">结果会显示在这里。</div>
           <section class="history-panel">
             <div class="history-head">
-              <h3>历史记录</h3>
+              <h3>最近生成记录</h3>
               <button id="history-refresh" type="button" class="secondary mini">刷新</button>
             </div>
             <div class="history-filter">
@@ -525,7 +535,7 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260609-4"></script>
+    <script src="/static/app.js?v=20260612-2"></script>
     <script src="/static/api-presets.js?v=20260603-12"></script>
     <script src="/static/secret-toggle.js?v=20260528-1"></script>
   </body>

@@ -36,12 +36,15 @@ USERS_PATH = CONFIG_DIR / "users.json"
 AUTH_SETTINGS_PATH = CONFIG_DIR / "auth-settings.json"
 HISTORY_PATH = CONFIG_DIR / "generation-history.json"
 DOWNLOAD_CACHE_DIR = CONFIG_DIR / "download-cache"
+RESUME_JOBS_DIR = CONFIG_DIR / "resume-jobs"
 DEFAULT_TEMPLATE_PATH = BASE_DIR / "templates_docx" / "default-training-log.docx"
 MAX_TEXT_CHARS = 18000
 MAX_REQUIREMENTS_CHARS = 10000
 HISTORY_LIMIT = 500
 SESSION_COOKIE = "training_log_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
+OPENAI_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "300") or "300")
+OLLAMA_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "900") or "900")
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_TASKS: dict[str, asyncio.Task[Any]] = {}
 
@@ -390,15 +393,36 @@ async def create_fill_job(
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
         "id": job_id,
+        "resume_id": job_id,
         "status": "running",
         "completed": 0,
         "total": len(records),
         "current": "",
         "message": "准备开始批量生成...",
         "cancel_requested": False,
+        "api_format": api_config["format"],
+        "model": api_config["model"],
+        "poll_interval_ms": job_poll_interval_ms(api_config),
         "result": None,
         "error": "",
     }
+    resume_state = create_resume_job_state(
+        job_id,
+        saved_path,
+        original_filename,
+        document_text[:MAX_TEXT_CHARS],
+        requirements_text[:MAX_REQUIREMENTS_CHARS],
+        records,
+        fields,
+        api_config,
+        defaults,
+        custom_prompt,
+        custom_skills,
+        output_format,
+        output_package_mode,
+        user,
+        request_history_context(request),
+    )
     JOB_TASKS[job_id] = asyncio.create_task(
         run_fill_job(
             job_id,
@@ -416,6 +440,7 @@ async def create_fill_job(
             output_package_mode,
             user,
             request_history_context(request),
+            resume_state,
         )
     )
     return job_snapshot(job_id)
@@ -440,6 +465,40 @@ async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
     if task and not task.done():
         task.cancel()
     return job_snapshot(job_id)
+
+
+@app.get("/api/resume-jobs")
+async def list_resume_jobs(request: Request) -> dict[str, Any]:
+    user = require_current_user(request)
+    return {"items": list_resume_jobs_for_user(user)}
+
+
+@app.post("/api/resume-jobs/{job_id}/continue")
+async def continue_resume_job(job_id: str, payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    user = require_current_user(request)
+    state = load_resume_job(job_id)
+    if not state or not can_view_resume_job(state, user):
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    if int(state.get("completed") or 0) >= int(state.get("total") or 0):
+        raise HTTPException(status_code=400, detail="这个任务已经完成。")
+    task = JOB_TASKS.get(job_id)
+    if job_id in JOBS and JOBS[job_id].get("status") == "running" and task and not task.done():
+        return job_snapshot(job_id)
+    api_payload = payload.get("api_config") if isinstance(payload.get("api_config"), dict) else payload
+    api_config = normalize_api_config(api_payload if isinstance(api_payload, dict) else {})
+    return start_resume_job(state, user, api_config)
+
+
+@app.delete("/api/resume-jobs/{job_id}")
+async def discard_resume_job(job_id: str, request: Request) -> dict[str, Any]:
+    user = require_current_user(request)
+    state = load_resume_job(job_id)
+    if not state or not can_view_resume_job(state, user):
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    state["status"] = "discarded"
+    state["message"] = "已忽略这个未完成任务。"
+    save_resume_job(state)
+    return {"ok": True}
 
 
 @app.post("/api/models")
@@ -679,7 +738,7 @@ async def fill_form(
             if output_path.is_dir():
                 folder_path = output_folder_display_path(output_path)
                 folder_files = output_folder_file_links(output_path)
-                folder_zip_url = ""
+                folder_zip_url = output_folder_zip_url(output_path)
             else:
                 download_url = f"/download/{output_path.name}"
                 folder_files = []
@@ -1070,6 +1129,279 @@ def append_generation_history(entry: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def resume_job_path(job_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    return RESUME_JOBS_DIR / f"{job_id}.json"
+
+
+def load_resume_job(job_id: str) -> dict[str, Any] | None:
+    path = resume_job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def save_resume_job(state: dict[str, Any]) -> dict[str, Any]:
+    state["updated_at"] = utc_now_iso()
+    write_json_atomic(resume_job_path(str(state["id"])), state)
+    return state
+
+
+def list_resume_jobs_for_user(user: dict[str, str]) -> list[dict[str, Any]]:
+    if not RESUME_JOBS_DIR.exists():
+        return []
+    jobs = []
+    for path in RESUME_JOBS_DIR.glob("*.json"):
+        if not re.fullmatch(r"[a-f0-9]{32}\.json", path.name):
+            continue
+        state = load_resume_job(path.stem)
+        if not state or not can_view_resume_job(state, user):
+            continue
+        completed = int(state.get("completed") or len(state.get("generated_records") or []))
+        total = int(state.get("total") or len(state.get("selected_records") or []))
+        if total <= 0 or completed >= total or state.get("status") == "complete":
+            continue
+        jobs.append(public_resume_job(state))
+    jobs.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return jobs
+
+
+def can_view_resume_job(state: dict[str, Any], user: dict[str, str]) -> bool:
+    if not is_auth_required():
+        return True
+    return str(state.get("login_user") or "") == user.get("username")
+
+
+def public_resume_job(state: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(state.get("id") or "")
+    status = str(state.get("status") or "interrupted")
+    task = JOB_TASKS.get(job_id)
+    if status == "running" and (not task or task.done()):
+        status = "interrupted"
+    completed = int(state.get("completed") or len(state.get("generated_records") or []))
+    total = int(state.get("total") or len(state.get("selected_records") or []))
+    output_folder = resolve_resume_output_folder(state) if state.get("output_folder") else None
+    return {
+        "id": job_id,
+        "title": str(state.get("title") or "未完成批量任务"),
+        "status": status,
+        "completed": completed,
+        "total": total,
+        "remaining": max(total - completed, 0),
+        "current": str(state.get("current") or ""),
+        "message": str(state.get("message") or ""),
+        "created_at": str(state.get("created_at") or ""),
+        "updated_at": str(state.get("updated_at") or ""),
+        "output_format": str(state.get("output_format") or "docx"),
+        "package_mode": str(state.get("output_package_mode") or "folder"),
+        "folder_path": output_folder_display_path(output_folder) if output_folder else "",
+        "folder_files": output_folder_file_links(output_folder) if output_folder else [],
+        "folder_zip_url": output_folder_zip_url(output_folder) if output_folder else "",
+    }
+
+
+def create_resume_job_state(
+    job_id: str,
+    template_path: Path,
+    original_filename: str,
+    document_text: str,
+    requirements_text: str,
+    selected_records: list[dict[str, Any]],
+    fields: list[dict[str, Any]],
+    api_config: dict[str, str],
+    defaults: dict[str, Any],
+    custom_prompt: str,
+    custom_skills: str,
+    output_format: str,
+    output_package_mode: str,
+    user: dict[str, str],
+    request_context: dict[str, str],
+) -> dict[str, Any]:
+    title = package_title_for_records(selected_records) if selected_records else "批量训练日志"
+    output_folder = OUTPUT_DIR / f"{job_id}-{safe_filename(title)}"
+    output_folder.mkdir(parents=True, exist_ok=True)
+    state = {
+        "version": 1,
+        "id": job_id,
+        "title": title,
+        "status": "running",
+        "created_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
+        "login_user": user.get("username", "guest"),
+        "login_display_name": user.get("display_name") or user.get("username", "guest"),
+        "total": len(selected_records),
+        "completed": 0,
+        "current": "",
+        "message": "准备开始批量生成...",
+        "template_path": str(template_path),
+        "original_filename": original_filename,
+        "document_text": document_text,
+        "requirements_text": requirements_text,
+        "selected_records": selected_records,
+        "fields": fields,
+        "api_config": sanitize_resume_api_config(api_config),
+        "defaults": defaults,
+        "custom_prompt": custom_prompt,
+        "custom_skills": custom_skills,
+        "output_format": output_format,
+        "output_package_mode": output_package_mode,
+        "request_context": request_context,
+        "output_folder": str(output_folder),
+        "generated_records": [],
+        "generated_files": [],
+        "used_ai": can_use_ai(api_config),
+        "error": "",
+    }
+    return save_resume_job(state)
+
+
+def sanitize_resume_api_config(api_config: dict[str, str]) -> dict[str, str]:
+    return {
+        "format": api_config.get("format", ""),
+        "base_url": api_config.get("base_url", ""),
+        "api_key": "",
+        "model": api_config.get("model", ""),
+        "gpu_model": api_config.get("gpu_model", ""),
+    }
+
+
+def resolve_resume_output_folder(state: dict[str, Any]) -> Path:
+    folder = str(state.get("output_folder") or "").strip()
+    if folder:
+        folder_path = Path(folder).resolve()
+    else:
+        folder_path = OUTPUT_DIR / f"{state.get('id', uuid.uuid4().hex)}-{safe_filename(str(state.get('title') or 'training-logs'))}"
+    output_root = OUTPUT_DIR.resolve()
+    try:
+        resolved = folder_path.resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="任务输出目录不存在。")
+    if resolved != output_root and output_root not in resolved.parents:
+        raise HTTPException(status_code=404, detail="任务输出目录不存在。")
+    return resolved
+
+
+def resume_job_payload(state: dict[str, Any], used_ai: bool, partial: bool = False) -> dict[str, Any]:
+    records = [record for record in state.get("generated_records") or [] if isinstance(record, dict)]
+    output_folder = resolve_resume_output_folder(state)
+    return {
+        "filename": str(state.get("original_filename") or "训练日志模板.docx"),
+        "used_ai": used_ai,
+        "batch": True,
+        "partial": partial,
+        "resume_id": state.get("id", ""),
+        "completed": len(records),
+        "total": int(state.get("total") or len(state.get("selected_records") or records)),
+        "records": records,
+        "answers": records[0].get("answers", []) if records else [],
+        "download_url": "",
+        "folder_path": output_folder_display_path(output_folder) if output_folder.exists() else "",
+        "folder_files": output_folder_file_links(output_folder) if output_folder.exists() else [],
+        "folder_zip_url": output_folder_zip_url(output_folder) if output_folder.exists() else "",
+        "source_preview": str(state.get("document_text") or "")[:1200],
+        "requirements_preview": str(state.get("requirements_text") or "")[:1200],
+    }
+
+
+def resume_job_to_run_args(state: dict[str, Any], api_config: dict[str, str] | None = None) -> dict[str, Any]:
+    saved_api_config = state.get("api_config") if isinstance(state.get("api_config"), dict) else {}
+    selected_records = [record for record in state.get("selected_records") or [] if isinstance(record, dict)]
+    fields = [field for field in state.get("fields") or [] if isinstance(field, dict)]
+    defaults = state.get("defaults") if isinstance(state.get("defaults"), dict) else {}
+    request_context = state.get("request_context") if isinstance(state.get("request_context"), dict) else {}
+    return {
+        "template_path": Path(str(state.get("template_path") or DEFAULT_TEMPLATE_PATH)),
+        "original_filename": str(state.get("original_filename") or "训练日志模板.docx"),
+        "document_text": str(state.get("document_text") or "")[:MAX_TEXT_CHARS],
+        "requirements_text": str(state.get("requirements_text") or "")[:MAX_REQUIREMENTS_CHARS],
+        "selected_records": selected_records,
+        "fields": fields or default_training_log_fields(),
+        "api_config": api_config or normalize_api_config(saved_api_config),
+        "defaults": {
+            "start_date": str(defaults.get("start_date") or ""),
+            "default_coach": str(defaults.get("default_coach") or ""),
+            "default_writer": str(defaults.get("default_writer") or ""),
+            "selected_modules": defaults.get("selected_modules") if isinstance(defaults.get("selected_modules"), list) else [],
+            "link_module_teacher": bool(defaults.get("link_module_teacher")),
+            "module_teacher_map": defaults.get("module_teacher_map") if isinstance(defaults.get("module_teacher_map"), dict) else {},
+        },
+        "custom_prompt": str(state.get("custom_prompt") or ""),
+        "custom_skills": str(state.get("custom_skills") or ""),
+        "output_format": str(state.get("output_format") or "docx"),
+        "output_package_mode": str(state.get("output_package_mode") or "folder"),
+        "request_context": {
+            "source_label": str(request_context.get("source_label") or "本机"),
+            "client_host": str(request_context.get("client_host") or ""),
+            "page_host": str(request_context.get("page_host") or ""),
+        },
+    }
+
+
+def start_resume_job(state: dict[str, Any], user: dict[str, str], api_config: dict[str, str]) -> dict[str, Any]:
+    job_id = str(state.get("id") or "")
+    args = resume_job_to_run_args(state, api_config)
+    completed = int(state.get("completed") or len(state.get("generated_records") or []))
+    total = int(state.get("total") or len(args["selected_records"]))
+    state["status"] = "running"
+    state["message"] = f"继续生成剩余 {max(total - completed, 0)} 篇..."
+    state["error"] = ""
+    state["api_config"] = sanitize_resume_api_config(api_config)
+    save_resume_job(state)
+    JOBS[job_id] = {
+        "id": job_id,
+        "resume_id": job_id,
+        "status": "running",
+        "completed": completed,
+        "total": total,
+        "current": str(state.get("current") or ""),
+        "message": state["message"],
+        "cancel_requested": False,
+        "api_format": api_config["format"],
+        "model": api_config["model"],
+        "poll_interval_ms": job_poll_interval_ms(api_config),
+        "result": None,
+        "partial_result": resume_job_payload(state, can_use_ai(api_config), partial=True) if completed else None,
+        "error": "",
+    }
+    JOB_TASKS[job_id] = asyncio.create_task(
+        run_fill_job(
+            job_id,
+            args["template_path"],
+            args["original_filename"],
+            args["document_text"],
+            args["requirements_text"],
+            args["selected_records"],
+            args["fields"],
+            args["api_config"],
+            args["defaults"],
+            args["custom_prompt"],
+            args["custom_skills"],
+            args["output_format"],
+            args["output_package_mode"],
+            user,
+            args["request_context"],
+            state,
+        )
+    )
+    return job_snapshot(job_id)
+
+
 def request_history_context(request: Request) -> dict[str, str]:
     forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     client_host = forwarded_for or (request.client.host if request.client else "")
@@ -1212,8 +1544,8 @@ def history_downloads(payload: dict[str, Any]) -> list[dict[str, str]]:
     downloads: list[dict[str, str]] = []
     if payload.get("download_url"):
         downloads.append({"label": "下载文件", "url": str(payload["download_url"])})
-    if payload.get("folder_zip_url") and not payload.get("folder_path"):
-        downloads.append({"label": "下载全部 ZIP", "url": str(payload["folder_zip_url"])})
+    if payload.get("folder_zip_url"):
+        downloads.append({"label": "下载整个文件夹", "url": str(payload["folder_zip_url"]), "kind": "folder_zip"})
     for file in payload.get("folder_files") or []:
         if isinstance(file, dict) and file.get("download_url") and file.get("name"):
             downloads.append({"label": str(file["name"]), "url": str(file["download_url"])})
@@ -1259,7 +1591,7 @@ def history_folder_zip_download(entry: dict[str, Any]) -> dict[str, str] | None:
     if not folder_name:
         return None
     return {
-        "label": "批量下载全部 ZIP",
+        "label": "下载整个文件夹",
         "url": f"/download-folder-zip/{folder_name}",
         "kind": "folder_zip",
     }
@@ -1510,6 +1842,22 @@ def attach_stats_to_records(records: list[dict[str, Any]], stats: dict[str, Any]
         record["generation_stats"] = record_stats
 
 
+def combine_generation_stats(stats_items: list[dict[str, Any]]) -> dict[str, Any]:
+    clean_items = [item for item in stats_items if isinstance(item, dict)]
+    if not clean_items:
+        return fallback_generation_stats(0)
+    first = clean_items[0]
+    token_sources = {str(item.get("token_source") or "") for item in clean_items}
+    return {
+        **first,
+        "duration_seconds": round(sum(float(item.get("duration_seconds") or 0) for item in clean_items), 2),
+        "input_tokens": sum(int(item.get("input_tokens") or 0) for item in clean_items),
+        "output_tokens": sum(int(item.get("output_tokens") or 0) for item in clean_items),
+        "total_tokens": sum(int(item.get("total_tokens") or 0) for item in clean_items),
+        "token_source": first.get("token_source", "estimated") if len(token_sources) == 1 else "mixed",
+    }
+
+
 def build_selected_records_requirements(records: list[dict[str, Any]], requirements_text: str) -> str:
     return json.dumps(
         {
@@ -1521,9 +1869,45 @@ def build_selected_records_requirements(records: list[dict[str, Any]], requireme
     )
 
 
+def build_batch_json_retry_prompt(original_prompt: str, invalid_content: str) -> str:
+    return json.dumps(
+        {
+            "task": "上一次模型输出不是可解析的 JSON。请重新完成原任务，只返回合法 JSON，不要返回解释、Markdown、代码块或 <think> 内容。",
+            "required_schema": {
+                "records": [
+                    {
+                        "title": "训练日志标题",
+                        "answers": [
+                            {
+                                "name": "字段名",
+                                "value": "要写入模板的内容",
+                                "confidence": 0.0,
+                                "reason": "简短依据",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "rules": [
+                "顶层必须是 JSON 对象，并且必须包含 records 数组。",
+                "records 中每一项必须包含 title 和 answers。",
+                "answers 必须是数组，每一项必须包含 name、value、confidence、reason。",
+                "只输出 JSON 本体，不要添加任何额外文字。",
+            ],
+            "invalid_previous_output_preview": invalid_content[:2000],
+            "original_task": original_prompt,
+        },
+        ensure_ascii=False,
+    )
+
+
 def job_snapshot(job_id: str) -> dict[str, Any]:
     job = JOBS[job_id]
     return {key: value for key, value in job.items() if key != "cancel_requested"}
+
+
+def job_poll_interval_ms(api_config: dict[str, str]) -> int:
+    return 3000 if api_config.get("format") == "ollama" else 1200
 
 
 async def run_fill_job(
@@ -1542,19 +1926,41 @@ async def run_fill_job(
     output_package_mode: str,
     user: dict[str, str],
     request_context: dict[str, str],
+    resume_state: dict[str, Any] | None = None,
 ) -> None:
     job = JOBS[job_id]
     generated_paths: list[tuple[Path, str]] = []
-    generated_records: list[dict[str, Any]] = []
-    used_names: set[str] = set()
+    generated_records: list[dict[str, Any]] = [record for record in (resume_state or {}).get("generated_records", []) if isinstance(record, dict)]
+    output_folder = resolve_resume_output_folder(resume_state) if resume_state else None
+    if output_folder:
+        output_folder.mkdir(parents=True, exist_ok=True)
+    used_names: set[str] = {
+        str(file.get("name") or "")
+        for file in (resume_state or {}).get("generated_files", [])
+        if isinstance(file, dict) and file.get("name")
+    }
+    if output_folder and output_folder.exists():
+        used_names.update(child.name for child in output_folder.iterdir() if child.is_file())
     used_ai = can_use_ai(api_config)
+    start_index = min(len(generated_records), len(selected_records))
+    job["completed"] = start_index
     try:
-        for index, selected_record in enumerate(selected_records, start=1):
+        if resume_state:
+            resume_state["status"] = "running"
+            resume_state["used_ai"] = used_ai
+            resume_state["api_config"] = sanitize_resume_api_config(api_config)
+            resume_state["completed"] = start_index
+            save_resume_job(resume_state)
+        for index, selected_record in enumerate(selected_records[start_index:], start=start_index + 1):
             if job.get("cancel_requested"):
                 raise asyncio.CancelledError()
             title = str(selected_record.get("title") or f"training-log-{index}")
             job["current"] = title
             job["message"] = f"正在生成第 {index}/{len(selected_records)} 篇：{title}"
+            if resume_state:
+                resume_state["current"] = title
+                resume_state["message"] = job["message"]
+                save_resume_job(resume_state)
             if used_ai:
                 result = await generate_selected_records_one_by_one(
                     document_text,
@@ -1583,25 +1989,37 @@ async def run_fill_job(
             output_path = fill_docx_template(template_path, record.get("answers", []), output_title)
             output_path = convert_output_format(output_path, output_format)
             file_name = unique_package_filename(f"{safe_filename(output_title)}{output_path.suffix}", used_names)
-            generated_paths.append((output_path, file_name))
+            if output_folder:
+                target_path = output_folder / file_name
+                shutil.copy2(output_path, target_path)
+                cleanup_packaged_temp_outputs([output_path])
+            else:
+                generated_paths.append((output_path, file_name))
             generated_records.append(record)
             job["completed"] = index
             job["message"] = f"已写入第 {index}/{len(selected_records)} 篇：{title}"
+            if resume_state:
+                resume_state["completed"] = index
+                resume_state["generated_records"] = generated_records
+                resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
+                resume_state["message"] = job["message"]
+                save_resume_job(resume_state)
 
         job["message"] = "正在整理下载文件..."
-        package_path = write_generated_package(generated_paths, generated_records, output_package_mode)
+        package_path = output_folder if output_folder else write_generated_package(generated_paths, generated_records, output_package_mode)
         job["status"] = "complete"
         job["message"] = "批量生成完成。"
         job["result"] = {
             "filename": original_filename,
             "used_ai": used_ai,
             "batch": True,
+            "resume_id": job_id if resume_state else "",
             "records": generated_records,
             "answers": generated_records[0]["answers"] if generated_records else [],
             "download_url": "" if package_path.is_dir() else f"/download/{package_path.name}",
             "folder_path": output_folder_display_path(package_path) if package_path.is_dir() else "",
             "folder_files": output_folder_file_links(package_path) if package_path.is_dir() else [],
-            "folder_zip_url": "",
+            "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
         }
@@ -1619,47 +2037,85 @@ async def run_fill_job(
         )
         job["result"]["history_id"] = entry["id"]
         job["result"]["generated_user"] = entry["generated_user"]
+        if resume_state:
+            resume_state["status"] = "complete"
+            resume_state["message"] = "批量生成完成。"
+            resume_state["completed"] = len(selected_records)
+            resume_state["generated_records"] = generated_records
+            resume_state["generated_files"] = output_folder_file_links(package_path) if package_path.is_dir() else []
+            save_resume_job(resume_state)
     except asyncio.CancelledError:
         job["status"] = "canceled"
         job["message"] = "已取消批量生成。"
+        if resume_state:
+            resume_state["status"] = "canceled"
+            resume_state["message"] = f"已取消批量生成，已完成 {len(generated_records)}/{len(selected_records)} 篇。"
+            resume_state["completed"] = len(generated_records)
+            resume_state["generated_records"] = generated_records
+            resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
+            save_resume_job(resume_state)
+            if generated_records:
+                job["partial_result"] = resume_job_payload(resume_state, used_ai, partial=True)
     except HTTPException as exc:
         job["status"] = "failed"
         job["error"] = str(exc.detail)
         job["message"] = str(exc.detail)
-        attach_partial_batch_result(
-            job,
-            generated_paths,
-            generated_records,
-            output_package_mode,
-            original_filename,
-            used_ai,
-            document_text,
-            requirements_text,
-            user,
-            request_context,
-            defaults.get("default_writer", ""),
-            api_config,
-            output_format,
-        )
+        if resume_state:
+            resume_state["status"] = "failed"
+            resume_state["error"] = job["error"]
+            resume_state["message"] = f"{job['message']} 已完成 {len(generated_records)}/{len(selected_records)} 篇，可继续剩余任务。"
+            resume_state["completed"] = len(generated_records)
+            resume_state["generated_records"] = generated_records
+            resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
+            save_resume_job(resume_state)
+            if generated_records:
+                job["partial_result"] = resume_job_payload(resume_state, used_ai, partial=True)
+        else:
+            attach_partial_batch_result(
+                job,
+                generated_paths,
+                generated_records,
+                output_package_mode,
+                original_filename,
+                used_ai,
+                document_text,
+                requirements_text,
+                user,
+                request_context,
+                defaults.get("default_writer", ""),
+                api_config,
+                output_format,
+            )
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
         job["message"] = str(exc)
-        attach_partial_batch_result(
-            job,
-            generated_paths,
-            generated_records,
-            output_package_mode,
-            original_filename,
-            used_ai,
-            document_text,
-            requirements_text,
-            user,
-            request_context,
-            defaults.get("default_writer", ""),
-            api_config,
-            output_format,
-        )
+        if resume_state:
+            resume_state["status"] = "failed"
+            resume_state["error"] = job["error"]
+            resume_state["message"] = f"{job['message']} 已完成 {len(generated_records)}/{len(selected_records)} 篇，可继续剩余任务。"
+            resume_state["completed"] = len(generated_records)
+            resume_state["generated_records"] = generated_records
+            resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
+            save_resume_job(resume_state)
+            if generated_records:
+                job["partial_result"] = resume_job_payload(resume_state, used_ai, partial=True)
+        else:
+            attach_partial_batch_result(
+                job,
+                generated_paths,
+                generated_records,
+                output_package_mode,
+                original_filename,
+                used_ai,
+                document_text,
+                requirements_text,
+                user,
+                request_context,
+                defaults.get("default_writer", ""),
+                api_config,
+                output_format,
+            )
 
 
 def attach_partial_batch_result(
@@ -2421,10 +2877,29 @@ async def generate_batch_records(
     prompt = build_batch_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
         raw_result = await call_ollama_raw_with_stats(base_url, model, prompt, api_config["api_key"])
+        raw_results = [raw_result]
+        try:
+            records = parse_batch_json(raw_result["content"])
+        except HTTPException as exc:
+            if not is_invalid_ai_json_error(exc):
+                raise
+            repair_prompt = build_batch_json_retry_prompt(prompt, raw_result["content"])
+            repair_result = await call_ollama_raw_with_stats(base_url, model, repair_prompt, api_config["api_key"])
+            raw_results.append(repair_result)
+            try:
+                records = parse_batch_json(repair_result["content"])
+            except HTTPException as retry_exc:
+                detail = retry_exc.detail if isinstance(retry_exc.detail, str) else str(retry_exc.detail)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Ollama 返回内容不是可用 JSON，已自动做 1 次格式修复重试仍失败：{detail}",
+                ) from retry_exc
+        stats = combine_generation_stats([item["generation_stats"] for item in raw_results])
     else:
         raw_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
-    records = parse_batch_json(raw_result["content"])
-    attach_stats_to_records(records, raw_result["generation_stats"])
+        records = parse_batch_json(raw_result["content"])
+        stats = raw_result["generation_stats"]
+    attach_stats_to_records(records, stats)
     return {"used_ai": True, "records": records}
 
 
@@ -2495,7 +2970,13 @@ async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, pr
 async def call_openai_compatible_raw_with_stats(base_url: str, api_key: str, model: str, prompt: str) -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
+        timeout = httpx.Timeout(
+            float(OPENAI_REQUEST_TIMEOUT_SECONDS),
+            connect=30.0,
+            read=float(OPENAI_REQUEST_TIMEOUT_SECONDS),
+            write=30.0,
+            pool=30.0,
+        )
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
@@ -2520,7 +3001,7 @@ async def call_openai_compatible_raw_with_stats(base_url: str, api_key: str, mod
     except httpx.TimeoutException as exc:
         raise HTTPException(
             status_code=504,
-            detail=f"AI API 请求超时：正式生成内容较长，模型在 300 秒内没有返回。当前模型：{model}。",
+            detail=f"AI API 请求超时：正式生成内容较长，模型在 {OPENAI_REQUEST_TIMEOUT_SECONDS} 秒内没有返回。当前模型：{model}。",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"AI API 请求失败：{type(exc).__name__}: {exc}") from exc
@@ -2582,7 +3063,13 @@ async def call_ollama_raw(base_url: str, model: str, prompt: str, api_key: str =
 async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
+        timeout = httpx.Timeout(
+            float(OLLAMA_REQUEST_TIMEOUT_SECONDS),
+            connect=30.0,
+            read=float(OLLAMA_REQUEST_TIMEOUT_SECONDS),
+            write=30.0,
+            pool=30.0,
+        )
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{base_url}/api/chat",
@@ -2609,7 +3096,7 @@ async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api
     except httpx.TimeoutException as exc:
         raise HTTPException(
             status_code=504,
-            detail=f"Ollama 请求超时：正式生成内容较长，模型在 300 秒内没有返回。当前模型：{model}。",
+            detail=f"Ollama 请求超时：正式生成内容较长，模型在 {OLLAMA_REQUEST_TIMEOUT_SECONDS} 秒内没有返回。当前模型：{model}。",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Ollama 请求失败：{type(exc).__name__}: {exc}") from exc
@@ -2795,48 +3282,130 @@ def describe_ai_http_error(status_code: int, body: str, base_url: str, model: st
 
 
 def parse_ai_json(content: str) -> list[dict[str, Any]]:
-    content = clean_json_content(content)
-    try:
-        parsed = json.loads(content)
-        answers = parsed.get("answers", parsed)
-        if not isinstance(answers, list):
-            raise ValueError("answers must be a list")
-        return normalize_answers(answers)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {exc}")
+    candidates = json_text_candidates(content)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            answers = parsed.get("answers", parsed) if isinstance(parsed, dict) else parsed
+            if isinstance(answers, dict):
+                answers = [answers]
+            if not isinstance(answers, list):
+                raise ValueError("answers must be a list")
+            return normalize_answers(answers)
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            last_error = exc
+            continue
+    detail = last_error or "no JSON object found"
+    raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {detail}")
 
 
 def parse_batch_json(content: str) -> list[dict[str, Any]]:
-    content = clean_json_content(content)
-    try:
-        parsed = json.loads(content)
-        records = parsed.get("records", parsed)
-        if not isinstance(records, list):
-            raise ValueError("records must be a list")
-        normalized = []
-        for index, record in enumerate(records, start=1):
-            if not isinstance(record, dict):
-                continue
-            answers = record.get("answers", [])
-            if not isinstance(answers, list):
-                answers = []
-            normalized.append(
-                {
-                    "title": str(record.get("title") or f"training-log-{index}").strip(),
-                    "answers": normalize_answers(answers),
-                }
-            )
-        return normalized
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise HTTPException(status_code=502, detail=f"AI returned invalid batch JSON: {exc}")
+    candidates = json_text_candidates(content)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            records = coerce_batch_records(parsed)
+            normalized = []
+            for index, record in enumerate(records, start=1):
+                if not isinstance(record, dict):
+                    continue
+                answers = record.get("answers", [])
+                if isinstance(answers, dict):
+                    answers = [answers]
+                if not isinstance(answers, list):
+                    answers = []
+                normalized.append(
+                    {
+                        "title": str(record.get("title") or f"training-log-{index}").strip(),
+                        "answers": normalize_answers(answers),
+                    }
+                )
+            if not normalized:
+                raise ValueError("records must contain at least one valid record")
+            return normalized
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            last_error = exc
+            continue
+    detail = last_error or "no JSON object found"
+    raise HTTPException(status_code=502, detail=f"AI returned invalid batch JSON: {detail}")
+
+
+def coerce_batch_records(parsed: Any) -> list[Any]:
+    if isinstance(parsed, list):
+        return parsed
+    if not isinstance(parsed, dict):
+        raise ValueError("records must be a list")
+    records = parsed.get("records")
+    if isinstance(records, list):
+        return records
+    if isinstance(records, dict):
+        return [records]
+    for key in ("record", "data", "result", "output"):
+        value = parsed.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested_records = value.get("records")
+            if isinstance(nested_records, list):
+                return nested_records
+            if isinstance(nested_records, dict):
+                return [nested_records]
+            if looks_like_batch_record(value):
+                return [value]
+    if looks_like_batch_record(parsed):
+        return [parsed]
+    raise ValueError("records must be a list")
+
+
+def looks_like_batch_record(value: dict[str, Any]) -> bool:
+    return "answers" in value or ("title" in value and any(key in value for key in ("训练内容", "学习笔记", "总结")))
+
+
+def is_invalid_ai_json_error(exc: HTTPException) -> bool:
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return exc.status_code == 502 and "invalid" in detail.lower() and "json" in detail.lower()
 
 
 def clean_json_content(content: str) -> str:
-    content = content.strip()
+    candidates = json_text_candidates(content)
+    return candidates[0] if candidates else str(content or "").strip()
+
+
+def json_text_candidates(content: str) -> list[str]:
+    content = normalize_json_source(content)
+    if not content:
+        return [""]
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(content)
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(content):
+        if char not in "{[":
+            continue
+        try:
+            _parsed, end = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        add(content[index:index + end])
+    match = re.search(r"(\{.*\}|\[.*\])", content, flags=re.DOTALL)
+    if match:
+        add(match.group(1))
+    return candidates
+
+
+def normalize_json_source(content: str) -> str:
+    content = str(content or "").strip()
+    content = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
     if content.startswith("```"):
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
-    match = re.search(r"(\{.*\}|\[.*\])", content, flags=re.DOTALL)
-    return match.group(1).strip() if match else content
+    return content
 
 
 def normalize_answers(answers: list[Any]) -> list[dict[str, Any]]:
@@ -2902,17 +3471,7 @@ def build_batch_prompt(
 ) -> str:
     return json.dumps(
         {
-            "task": (
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-                "请根据输入生成训练日志内容。",
-            ),
+            "task": "请根据输入生成训练日志内容。只返回合法 JSON，不要返回解释、Markdown、代码块或 <think> 内容。",
             "output_format": {
                 "records": [
                     {
@@ -2920,7 +3479,7 @@ def build_batch_prompt(
                         "answers": [
                             {
                                 "name": "字段名",
-                                "value": "瑕佸啓鍏ユā鏉跨殑鍐呭",
+                                "value": "要写入模板的内容",
                                 "confidence": 0.0,
                                 "reason": "简短依据",
                             }
@@ -2929,7 +3488,7 @@ def build_batch_prompt(
                 ]
             },
             "fields": fields,
-            "style_guide": "请根据输入生成训练日志内容。",
+            "style_guide": "顶层必须是对象，且必须包含 records 数组。records 中每一项必须包含 title 和 answers。answers 必须是数组。",
             "custom_prompt": custom_prompt.strip(),
             "custom_skills": parse_custom_skills(custom_skills),
             "monthly_requirements": requirements_text,

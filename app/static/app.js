@@ -29,6 +29,10 @@ const batchProgressCount = document.querySelector("#batch-progress-count");
 const batchProgressFill = document.querySelector("#batch-progress-fill");
 const batchProgressDetail = document.querySelector("#batch-progress-detail");
 const cancelBatchButton = document.querySelector("#cancel-batch");
+const resumePanel = document.querySelector("#resume-panel");
+const resumeStatus = document.querySelector("#resume-status");
+const resumeRefreshButton = document.querySelector("#resume-refresh");
+const resumeJobList = document.querySelector("#resume-job-list");
 const previewPanel = document.querySelector("#preview-panel");
 const previewList = document.querySelector("#preview-list");
 const previewConfirmed = document.querySelector("#preview-confirmed");
@@ -87,11 +91,13 @@ const promptPresetSelect = document.querySelector("#prompt-preset-select");
 const newPromptPresetButton = document.querySelector("#new-prompt-preset");
 const savePromptPresetButton = document.querySelector("#save-prompt-preset");
 const deletePromptPresetButton = document.querySelector("#delete-prompt-preset");
+const setDefaultPromptPresetButton = document.querySelector("#set-default-prompt-preset");
 const promptPresetStatus = document.querySelector("#prompt-preset-status");
 const skillsPresetSelect = document.querySelector("#skills-preset-select");
 const newSkillsPresetButton = document.querySelector("#new-skills-preset");
 const saveSkillsPresetButton = document.querySelector("#save-skills-preset");
 const deleteSkillsPresetButton = document.querySelector("#delete-skills-preset");
+const setDefaultSkillsPresetButton = document.querySelector("#set-default-skills-preset");
 const skillsPresetStatus = document.querySelector("#skills-preset-status");
 const customModeInput = document.querySelector("#custom-mode");
 const promptModeButton = document.querySelector("#prompt-mode");
@@ -131,15 +137,20 @@ let importedPlanSignature = "";
 let batchProgressTimer = null;
 let currentBatchJobId = "";
 let batchPollFailures = 0;
+const DEFAULT_BATCH_POLL_DELAY = 1200;
+let currentBatchPollDelay = DEFAULT_BATCH_POLL_DELAY;
 const criticalClickBindings = new WeakSet();
 let promptPresets = loadPromptPresets();
 let skillsPresets = loadSkillsPresets();
+let generationDefault = loadGenerationDefault();
 
 bindTopActionButtons();
 loadSavedConfig();
-renderPromptPresets();
-renderSkillsPresets();
-setCustomMode("prompt", { silent: true });
+renderPromptPresets(generationDefault.prompt_preset);
+renderSkillsPresets(generationDefault.skills_preset);
+applyPromptPreset(promptPresetSelect.value, { silent: true });
+applySkillsPreset(skillsPresetSelect.value, { silent: true });
+setCustomMode(generationDefault.mode, { silent: true });
 renderModuleTeacherControls();
 apiSettingsPanel.classList.add("hidden");
 if (new URLSearchParams(window.location.search).get("settings") === "1") {
@@ -349,6 +360,7 @@ historyUseWriterButton?.addEventListener("click", () => {
   historyWriterFilter.value = writer;
   loadGenerationHistory();
 });
+resumeRefreshButton?.addEventListener("click", () => loadResumeJobs());
 
 legacyModuleChecks.forEach((check) => {
   check.closest(".module-option").remove();
@@ -418,10 +430,12 @@ promptPresetSelect.addEventListener("change", () => applyPromptPreset(promptPres
 newPromptPresetButton.addEventListener("click", () => createPromptPreset());
 savePromptPresetButton.addEventListener("click", () => savePromptPreset());
 deletePromptPresetButton.addEventListener("click", () => deletePromptPreset());
+setDefaultPromptPresetButton?.addEventListener("click", () => setDefaultGenerationPreset("prompt"));
 skillsPresetSelect.addEventListener("change", () => applySkillsPreset(skillsPresetSelect.value));
 newSkillsPresetButton.addEventListener("click", () => createSkillsPreset());
 saveSkillsPresetButton.addEventListener("click", () => saveSkillsPreset());
 deleteSkillsPresetButton.addEventListener("click", () => deleteSkillsPreset());
+setDefaultSkillsPresetButton?.addEventListener("click", () => setDefaultGenerationPreset("skills"));
 promptModeButton.addEventListener("click", () => setCustomMode("prompt"));
 skillsModeButton.addEventListener("click", () => setCustomMode("skills"));
 cancelBatchButton.addEventListener("click", async () => {
@@ -636,6 +650,7 @@ function showAuthenticatedApp(user) {
   }
   loadAuthSettings();
   loadGenerationHistory();
+  loadResumeJobs();
   window.requestAnimationFrame(restoreWorkspaceLeftWidth);
 }
 
@@ -731,6 +746,7 @@ function buildClientBackup() {
     api_presets: window.exportApiPresetBackup?.() || [],
     prompt_presets: promptPresets.filter((preset) => !preset.builtin),
     skills_presets: skillsPresets.filter((preset) => !preset.builtin),
+    generation_default: generationDefault,
     ui_state: {
       form_schema: document.querySelector("#form-schema")?.value || "",
       custom_mode: customModeInput?.value || "prompt",
@@ -755,6 +771,9 @@ function restoreClientBackup(client) {
   window.importApiPresetBackup?.(client.api_presets || []);
   if (Array.isArray(client.prompt_presets)) window.localStorage.setItem("promptPresets", JSON.stringify(client.prompt_presets));
   if (Array.isArray(client.skills_presets)) window.localStorage.setItem("skillsPresets", JSON.stringify(client.skills_presets));
+  if (client.generation_default && typeof client.generation_default === "object") {
+    saveGenerationDefault(normalizeGenerationDefault(client.generation_default));
+  }
   const state = client.ui_state || {};
   if (Array.isArray(state.selected_modules) && state.selected_modules.length) modules = state.selected_modules.map(String);
   if (Array.isArray(state.teachers) && state.teachers.length) teachers = state.teachers.map(String);
@@ -928,12 +947,41 @@ function saveSkillsPresets() {
   window.localStorage.setItem("skillsPresets", JSON.stringify(customPresets));
 }
 
+function loadGenerationDefault() {
+  try {
+    return normalizeGenerationDefault(JSON.parse(window.localStorage.getItem("generationDefault") || "{}"));
+  } catch {
+    return normalizeGenerationDefault({});
+  }
+}
+
+function normalizeGenerationDefault(value) {
+  const payload = value && typeof value === "object" ? value : {};
+  return {
+    mode: payload.mode === "skills" ? "skills" : "prompt",
+    prompt_preset: String(payload.prompt_preset || "").trim(),
+    skills_preset: String(payload.skills_preset || "").trim(),
+  };
+}
+
+function saveGenerationDefault(value = generationDefault) {
+  generationDefault = normalizeGenerationDefault(value);
+  window.localStorage.setItem("generationDefault", JSON.stringify(generationDefault));
+}
+
+function presetOptionLabel(preset, isDefault) {
+  const tags = [];
+  if (preset.builtin) tags.push("系统");
+  if (isDefault) tags.push("默认");
+  return tags.length ? `${preset.name}（${tags.join(" / ")}）` : preset.name;
+}
+
 function renderPromptPresets(selectedName = promptPresetSelect.value || promptPresets[0]?.name || "") {
   promptPresetSelect.replaceChildren(
     ...promptPresets.map((preset) => {
       const option = document.createElement("option");
       option.value = preset.name;
-      option.textContent = preset.builtin ? `${preset.name}（系统）` : preset.name;
+      option.textContent = presetOptionLabel(preset, preset.name === generationDefault.prompt_preset);
       return option;
     })
   );
@@ -941,12 +989,14 @@ function renderPromptPresets(selectedName = promptPresetSelect.value || promptPr
   updatePromptPresetButtons();
 }
 
-function applyPromptPreset(name) {
+function applyPromptPreset(name, options = {}) {
   const preset = promptPresets.find((item) => item.name === name);
   if (!preset) return;
   customPromptInput.value = preset.prompt || "";
   promptPresetStatus.className = preset.builtin ? "" : "ok-text";
-  promptPresetStatus.textContent = `已选择：${preset.name}`;
+  if (!options.silent) {
+    promptPresetStatus.textContent = `已选择：${preset.name}`;
+  }
   updatePromptPresetButtons();
 }
 
@@ -996,6 +1046,9 @@ function deletePromptPreset() {
   }
   if (!window.confirm(`删除提示词配置 ${name}？`)) return;
   promptPresets = promptPresets.filter((item) => item.name !== name);
+  if (generationDefault.prompt_preset === name) {
+    saveGenerationDefault({ ...generationDefault, prompt_preset: "" });
+  }
   savePromptPresets();
   renderPromptPresets();
   promptPresetStatus.className = "ok-text";
@@ -1004,9 +1057,14 @@ function deletePromptPreset() {
 
 function updatePromptPresetButtons() {
   const preset = promptPresets.find((item) => item.name === promptPresetSelect.value);
-  const locked = !preset || preset.builtin;
+  const useSkills = customModeInput.value === "skills";
+  const locked = !preset || preset.builtin || useSkills;
+  newPromptPresetButton.disabled = useSkills;
   savePromptPresetButton.disabled = locked;
   deletePromptPresetButton.disabled = locked;
+  if (setDefaultPromptPresetButton) {
+    setDefaultPromptPresetButton.disabled = !preset || useSkills;
+  }
 }
 
 function renderSkillsPresets(selectedName = skillsPresetSelect.value || skillsPresets[0]?.name || "") {
@@ -1014,7 +1072,7 @@ function renderSkillsPresets(selectedName = skillsPresetSelect.value || skillsPr
     ...skillsPresets.map((preset) => {
       const option = document.createElement("option");
       option.value = preset.name;
-      option.textContent = preset.builtin ? `${preset.name}（系统）` : preset.name;
+      option.textContent = presetOptionLabel(preset, preset.name === generationDefault.skills_preset);
       return option;
     })
   );
@@ -1022,12 +1080,14 @@ function renderSkillsPresets(selectedName = skillsPresetSelect.value || skillsPr
   updateSkillsPresetButtons();
 }
 
-function applySkillsPreset(name) {
+function applySkillsPreset(name, options = {}) {
   const preset = skillsPresets.find((item) => item.name === name);
   if (!preset) return;
   customSkillsInput.value = preset.skills || "";
   skillsPresetStatus.className = preset.builtin ? "" : "ok-text";
-  skillsPresetStatus.textContent = `已选择：${preset.name}`;
+  if (!options.silent) {
+    skillsPresetStatus.textContent = `已选择：${preset.name}`;
+  }
   updateSkillsPresetButtons();
 }
 
@@ -1077,6 +1137,9 @@ function deleteSkillsPreset() {
   }
   if (!window.confirm(`删除 Skills 配置 ${name}？`)) return;
   skillsPresets = skillsPresets.filter((item) => item.name !== name);
+  if (generationDefault.skills_preset === name) {
+    saveGenerationDefault({ ...generationDefault, skills_preset: "" });
+  }
   saveSkillsPresets();
   renderSkillsPresets();
   skillsPresetStatus.className = "ok-text";
@@ -1085,9 +1148,49 @@ function deleteSkillsPreset() {
 
 function updateSkillsPresetButtons() {
   const preset = skillsPresets.find((item) => item.name === skillsPresetSelect.value);
-  const locked = !preset || preset.builtin;
+  const useSkills = customModeInput.value === "skills";
+  const locked = !preset || preset.builtin || !useSkills;
+  newSkillsPresetButton.disabled = !useSkills;
   saveSkillsPresetButton.disabled = locked;
   deleteSkillsPresetButton.disabled = locked;
+  if (setDefaultSkillsPresetButton) {
+    setDefaultSkillsPresetButton.disabled = !preset || !useSkills;
+  }
+}
+
+function setDefaultGenerationPreset(mode) {
+  if (mode === "skills") {
+    const preset = skillsPresets.find((item) => item.name === skillsPresetSelect.value);
+    if (!preset) return;
+    saveGenerationDefault({
+      ...generationDefault,
+      mode: "skills",
+      skills_preset: preset.name,
+      prompt_preset: generationDefault.prompt_preset || promptPresetSelect.value || "",
+    });
+    renderSkillsPresets(preset.name);
+    renderPromptPresets(promptPresetSelect.value);
+    setCustomMode("skills", { silent: true });
+    applySkillsPreset(preset.name, { silent: true });
+    skillsPresetStatus.className = "ok-text";
+    skillsPresetStatus.textContent = `已设为默认 Skills：${preset.name}`;
+    return;
+  }
+
+  const preset = promptPresets.find((item) => item.name === promptPresetSelect.value);
+  if (!preset) return;
+  saveGenerationDefault({
+    ...generationDefault,
+    mode: "prompt",
+    prompt_preset: preset.name,
+    skills_preset: generationDefault.skills_preset || skillsPresetSelect.value || "",
+  });
+  renderPromptPresets(preset.name);
+  renderSkillsPresets(skillsPresetSelect.value);
+  setCustomMode("prompt", { silent: true });
+  applyPromptPreset(preset.name, { silent: true });
+  promptPresetStatus.className = "ok-text";
+  promptPresetStatus.textContent = `已设为默认提示词：${preset.name}`;
 }
 
 function setCustomMode(mode, options = {}) {
@@ -1102,14 +1205,10 @@ function setCustomMode(mode, options = {}) {
   skillsSourceControls.forEach((item) => item.classList.toggle("hidden", !useSkills));
   customPromptInput.disabled = useSkills;
   promptPresetSelect.disabled = useSkills;
-  newPromptPresetButton.disabled = useSkills;
-  savePromptPresetButton.disabled = useSkills || promptPresets.find((item) => item.name === promptPresetSelect.value)?.builtin;
-  deletePromptPresetButton.disabled = savePromptPresetButton.disabled;
   customSkillsInput.disabled = !useSkills;
   skillsPresetSelect.disabled = !useSkills;
-  newSkillsPresetButton.disabled = !useSkills;
-  saveSkillsPresetButton.disabled = !useSkills || skillsPresets.find((item) => item.name === skillsPresetSelect.value)?.builtin;
-  deleteSkillsPresetButton.disabled = saveSkillsPresetButton.disabled;
+  updatePromptPresetButtons();
+  updateSkillsPresetButtons();
 }
 
 function currentPlanSignature() {
@@ -1567,6 +1666,7 @@ function renderResults(payload) {
   renderGeneratedUserNote(payload);
   renderDownload(payload.download_url, payload.folder_path, payload.folder_files, payload.folder_zip_url);
   loadGenerationHistory();
+  loadResumeJobs();
   results.className = "results";
   if (payload.batch && Array.isArray(payload.records)) {
     renderBatchResults(payload.records);
@@ -1756,7 +1856,8 @@ async function runBatchJob() {
     batchPollFailures = 0;
     setCancelBatchButton(true, true);
     renderBatchJobProgress(job);
-    scheduleBatchPoll(job.id, 700);
+    loadResumeJobs();
+    scheduleBatchPoll(job.id, Math.min(currentBatchPollDelay, 1200));
   } catch (error) {
     failBatchProgress(humanFetchError(error));
     statusPill.textContent = "失败";
@@ -1769,6 +1870,7 @@ function startBatchProgress(total) {
   window.clearTimeout(batchProgressTimer);
   currentBatchJobId = "";
   batchPollFailures = 0;
+  currentBatchPollDelay = DEFAULT_BATCH_POLL_DELAY;
   const safeTotal = Math.max(total, 1);
   batchProgressPanel.classList.remove("hidden");
   setCancelBatchButton(false, false);
@@ -1796,14 +1898,22 @@ async function pollBatchJob(jobId) {
   if (job.status === "failed") {
     currentBatchJobId = "";
     setCancelBatchButton(false, false);
+    loadResumeJobs();
     if (job.partial_result) {
       lastPayload = job.partial_result;
       renderResults(job.partial_result);
       copyButton.disabled = false;
-      failBatchProgress(job.message || job.error || "批量生成失败，已导出已完成部分。", job.partial_result);
+      failBatchProgress(job.message || job.error || "批量生成失败，已导出已完成部分。", job.partial_result, {
+        title: batchFailureTitle(job.message || job.error || ""),
+      });
       return;
     }
-    throw new Error(job.message || job.error || "批量生成失败");
+    const failureMessage = job.message || job.error || "批量生成失败";
+    failBatchProgress(failureMessage, null, { title: batchFailureTitle(failureMessage) });
+    statusPill.textContent = "失败";
+    results.className = "results empty";
+    results.textContent = failureMessage;
+    return;
   }
   if (job.status === "canceled") {
     currentBatchJobId = "";
@@ -1811,18 +1921,19 @@ async function pollBatchJob(jobId) {
     updateBatchProgress(0, "批量生成已取消", batchProgressCount.textContent || "0/0", job.message || "批量生成已取消。");
     statusPill.textContent = "已取消";
     results.className = "results empty";
-    results.textContent = "批量生成已取消，可以修改内容后重新生成。";
+    results.textContent = "批量生成已取消。已完成的篇数会保留，可以在“未完成批量任务”里继续生成剩余内容。";
+    loadResumeJobs();
     return;
   }
   setCancelBatchButton(true, true);
   scheduleBatchPoll(jobId);
 }
 
-function scheduleBatchPoll(jobId, delay = 1200) {
+function scheduleBatchPoll(jobId, delay = currentBatchPollDelay) {
   window.clearTimeout(batchProgressTimer);
   batchProgressTimer = window.setTimeout(() => {
     pollBatchJob(jobId).catch((error) => handleBatchPollError(jobId, error));
-  }, delay);
+  }, Number(delay) || DEFAULT_BATCH_POLL_DELAY);
 }
 
 function handleBatchPollError(jobId, error) {
@@ -1834,7 +1945,7 @@ function handleBatchPollError(jobId, error) {
     batchProgressTitle.textContent = "连接中断，正在重试";
     batchProgressDetail.textContent = `${humanFetchError(error)} 正在第 ${batchPollFailures} 次重试...`;
     setCancelBatchButton(true, true);
-    scheduleBatchPoll(jobId, Math.min(1600 + batchPollFailures * 500, 5000));
+    scheduleBatchPoll(jobId, Math.min(currentBatchPollDelay + batchPollFailures * 1000, 10000));
     return;
   }
   failBatchProgress(humanFetchError(error), null, {
@@ -1854,11 +1965,20 @@ function setCancelBatchButton(enabled, visible = true, label = "取消生成") {
 }
 
 function renderBatchJobProgress(job) {
+  currentBatchPollDelay = batchPollDelayFromJob(job);
   const total = Math.max(Number(job.total) || 0, 1);
   const completed = Math.min(Number(job.completed) || 0, total);
   const percent = Math.round((completed / total) * 100);
   const title = job.status === "complete" ? "批量生成完成" : "批量生成中";
   updateBatchProgress(percent, title, `${completed}/${total}`, job.message || "正在生成...");
+}
+
+function batchPollDelayFromJob(job) {
+  const value = Number(job?.poll_interval_ms);
+  if (Number.isFinite(value) && value >= 800) {
+    return Math.min(Math.max(value, 800), 8000);
+  }
+  return job?.api_format === "ollama" ? 3000 : DEFAULT_BATCH_POLL_DELAY;
 }
 
 function updateBatchProgress(percent, title, count, detail) {
@@ -1887,6 +2007,17 @@ function failBatchProgress(message, partialPayload = null, options = {}) {
   if (batchProgressPanel.classList.contains("hidden")) return;
   batchProgressTitle.textContent = options.title || (partialPayload ? "批量生成中断" : "批量生成失败");
   batchProgressDetail.textContent = message || "生成失败，请检查任务内容和 API 配置。";
+}
+
+function batchFailureTitle(message) {
+  const text = String(message || "").toLowerCase();
+  if (text.includes("json") || text.includes("records must") || text.includes("输出格式")) {
+    return "模型输出格式错误";
+  }
+  if (text.includes("timeout") || text.includes("超时")) {
+    return "模型请求超时";
+  }
+  return "批量生成中断";
 }
 
 function resetBatchProgress() {
@@ -2006,6 +2137,135 @@ async function loadGenerationHistory() {
   }
 }
 
+async function loadResumeJobs() {
+  if (!resumePanel || !resumeJobList || !resumeStatus) return;
+  resumeStatus.className = "";
+  resumeStatus.textContent = "正在检查未完成任务...";
+  try {
+    const response = await fetch("/api/resume-jobs");
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "读取未完成任务失败");
+    }
+    renderResumeJobs(payload.items || []);
+  } catch (error) {
+    resumePanel.classList.remove("hidden");
+    resumeJobList.replaceChildren();
+    resumeStatus.className = "error-text";
+    resumeStatus.textContent = humanFetchError(error);
+  }
+}
+
+function renderResumeJobs(items) {
+  resumeJobList.replaceChildren();
+  if (!items.length) {
+    resumePanel.classList.add("hidden");
+    resumeStatus.textContent = "";
+    return;
+  }
+  resumePanel.classList.remove("hidden");
+  resumeStatus.className = "";
+  resumeStatus.textContent = `发现 ${items.length} 个未完成批量任务，可以从已完成位置继续生成。`;
+  resumeJobList.replaceChildren(...items.map(createResumeJobNode));
+}
+
+function createResumeJobNode(item) {
+  const card = document.createElement("article");
+  card.className = "resume-job-item";
+
+  const top = document.createElement("div");
+  top.className = "resume-job-top";
+  const title = document.createElement("strong");
+  title.textContent = item.title || "未完成批量任务";
+  const badge = document.createElement("span");
+  badge.textContent = resumeStatusLabel(item.status);
+  top.append(title, badge);
+
+  const meta = document.createElement("div");
+  meta.className = "resume-job-meta";
+  meta.textContent = [
+    `进度：${Number(item.completed || 0)}/${Number(item.total || 0)}`,
+    `剩余：${Number(item.remaining || 0)} 篇`,
+    item.updated_at ? `更新：${formatHistoryTime(item.updated_at)}` : "",
+  ].filter(Boolean).join(" / ");
+
+  const message = document.createElement("p");
+  message.className = "resume-job-message";
+  message.textContent = item.message || "可以继续生成剩余文件。";
+
+  const actions = document.createElement("div");
+  actions.className = "resume-job-actions";
+  const continueButton = document.createElement("button");
+  continueButton.type = "button";
+  continueButton.textContent = "继续生成";
+  continueButton.addEventListener("click", () => continueResumeJob(item.id, continueButton));
+  actions.append(continueButton);
+
+  if (item.folder_zip_url) {
+    const downloadLink = document.createElement("a");
+    downloadLink.className = "resume-download-link";
+    downloadLink.href = item.folder_zip_url;
+    downloadLink.textContent = "下载已完成文件夹";
+    actions.append(downloadLink);
+  }
+
+  const files = Array.isArray(item.folder_files) ? item.folder_files : [];
+  if (files.length) {
+    const count = document.createElement("span");
+    count.className = "resume-file-count";
+    count.textContent = `已完成文件：${files.length} 个`;
+    actions.append(count);
+  }
+
+  card.append(top, meta, message, actions);
+  return card;
+}
+
+function resumeStatusLabel(status) {
+  if (status === "running") return "生成中";
+  if (status === "failed") return "失败可继续";
+  if (status === "canceled") return "已取消";
+  if (status === "interrupted") return "中断可继续";
+  return "未完成";
+}
+
+async function continueResumeJob(jobId, button) {
+  if (!jobId) return;
+  const oldText = button?.textContent || "继续生成";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在继续";
+  }
+  try {
+    const response = await fetch(`/api/resume-jobs/${jobId}/continue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_config: readApiConfig() }),
+    });
+    const job = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(job.detail || "继续任务失败");
+    }
+    currentBatchJobId = job.id;
+    batchPollFailures = 0;
+    batchProgressPanel.classList.remove("hidden");
+    setCancelBatchButton(true, true);
+    renderBatchJobProgress(job);
+    scheduleBatchPoll(job.id, Math.min(currentBatchPollDelay, 1200));
+    statusPill.textContent = "继续中";
+    results.className = "results empty";
+    results.textContent = "正在继续未完成的批量任务...";
+    loadResumeJobs();
+  } catch (error) {
+    resumeStatus.className = "error-text";
+    resumeStatus.textContent = humanFetchError(error);
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText;
+    }
+  }
+}
+
 function renderGenerationHistory(items, payload = {}) {
   historyList.replaceChildren();
   if (!items.length) {
@@ -2061,7 +2321,10 @@ function createHistoryItemNode(item) {
   actions.className = "history-actions";
   const downloads = Array.isArray(item.downloads) ? item.downloads : [];
   if (downloads.length) {
-    downloads.slice(0, 8).forEach((download) => {
+    const batchDownloads = downloads.filter((download) => download?.kind === "folder_zip");
+    const fileDownloads = downloads.filter((download) => download?.kind !== "folder_zip");
+    const visibleDownloads = batchDownloads.length ? batchDownloads : fileDownloads.slice(0, 8);
+    visibleDownloads.forEach((download) => {
       if (download.available === false) {
         const missing = document.createElement("span");
         missing.className = "history-missing-link";
@@ -2076,6 +2339,9 @@ function createHistoryItemNode(item) {
       if (download.kind === "folder_zip") link.classList.add("batch-history-download");
       actions.append(link);
     });
+    if (batchDownloads.length && fileDownloads.length) {
+      actions.append(createHistoryFilesDetails(fileDownloads));
+    }
   } else {
     const none = document.createElement("span");
     none.className = "history-missing-link";
@@ -2087,6 +2353,31 @@ function createHistoryItemNode(item) {
   if (titles.textContent) card.append(titles);
   card.append(actions);
   return card;
+}
+
+function createHistoryFilesDetails(downloads) {
+  const details = document.createElement("details");
+  details.className = "history-file-details";
+  const summary = document.createElement("summary");
+  summary.textContent = `查看单个文件（${downloads.length} 个）`;
+  const list = document.createElement("div");
+  list.className = "history-file-list";
+  downloads.forEach((download) => {
+    if (download.available === false) {
+      const missing = document.createElement("span");
+      missing.className = "history-missing-link";
+      missing.textContent = `${download.label || "文件"}已不存在`;
+      list.append(missing);
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = download.url;
+    link.textContent = download.label || "下载";
+    link.className = "history-download";
+    list.append(link);
+  });
+  details.append(summary, list);
+  return details;
 }
 
 function formatHistoryTime(value) {
@@ -2105,23 +2396,31 @@ function formatHistoryTime(value) {
 function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZipUrl = "") {
   downloadSlot.replaceChildren();
   if (folderPath) {
+    const files = Array.isArray(folderFiles)
+      ? folderFiles.filter((file) => file?.download_url && file?.name)
+      : [];
+    const resolvedFolderZipUrl = folderZipUrl || folderZipUrlFromPath(folderPath);
+    const card = document.createElement("div");
+    card.className = "folder-download-card";
+
     const message = document.createElement("div");
-    message.className = "download-link folder-output";
+    message.className = "folder-output";
     message.textContent = `文件夹已生成：${folderPath}`;
-    downloadSlot.append(message);
-    if (Array.isArray(folderFiles) && folderFiles.length) {
-      const list = document.createElement("div");
-      list.className = "folder-file-list";
-      folderFiles.forEach((file) => {
-        if (!file?.download_url || !file?.name) return;
-        const link = document.createElement("a");
-        link.className = "download-link";
-        link.href = file.download_url;
-        link.textContent = `下载 ${file.name}`;
-        list.append(link);
-      });
-      downloadSlot.append(list);
+
+    const actions = document.createElement("div");
+    actions.className = "folder-download-actions";
+    if (resolvedFolderZipUrl) {
+      const batchLink = document.createElement("a");
+      batchLink.className = "download-link batch-download";
+      batchLink.href = resolvedFolderZipUrl;
+      batchLink.textContent = "下载整个文件夹";
+      actions.append(batchLink);
     }
+    if (files.length) {
+      actions.append(createFolderFilesDetails(files));
+    }
+    card.append(message, actions);
+    downloadSlot.append(card);
     return;
   }
   if (!downloadUrl) return;
@@ -2135,6 +2434,29 @@ function renderDownload(downloadUrl, folderPath = "", folderFiles = [], folderZi
     link.textContent = suffix === "pdf" ? "下载已填写 PDF" : "下载已填写 DOCX";
   }
   downloadSlot.append(link);
+}
+
+function createFolderFilesDetails(files) {
+  const details = document.createElement("details");
+  details.className = "folder-file-details";
+  const summary = document.createElement("summary");
+  summary.textContent = `查看单个文件（${files.length} 个）`;
+  const list = document.createElement("div");
+  list.className = "folder-file-list";
+  files.forEach((file) => {
+    const link = document.createElement("a");
+    link.className = "download-link";
+    link.href = file.download_url;
+    link.textContent = `下载 ${file.name}`;
+    list.append(link);
+  });
+  details.append(summary, list);
+  return details;
+}
+
+function folderZipUrlFromPath(folderPath) {
+  const folderName = String(folderPath || "").replace(/\\/g, "/").split("/").filter(Boolean).pop();
+  return folderName ? `/download-folder-zip/${encodeURIComponent(folderName)}` : "";
 }
 
 function renderPreview(payload) {
