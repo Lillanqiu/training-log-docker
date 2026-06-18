@@ -904,8 +904,8 @@ button.mini {
 .history-list {
   display: grid;
   gap: 10px;
-  max-height: 360px;
-  overflow: auto;
+  /* 不再限高 / 不再内层滚动：让右栏自己的滚动条统一管历史 + 处理流程 + 温馨提示，
+     避免“滚动条套滚动条”的状态以及底部内容被卡住看不见。 */
 }
 
 .history-item {
@@ -921,16 +921,24 @@ button.mini {
 
 .history-item-top {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
-  gap: 10px;
-  align-items: flex-start;
+  gap: 6px 10px;
+  align-items: center;
   margin-bottom: 8px;
 }
 
 .history-item-top strong {
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--text);
   font-size: 14px;
   overflow-wrap: anywhere;
+}
+
+.history-item-top .history-time {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .history-item-top span,
@@ -939,6 +947,64 @@ button.mini {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+/* 填写人徽标 —— 让一眼就能看清这条记录是谁生成的 */
+.history-writer-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(15, 143, 105, 0.12);
+  color: var(--primary, #0f8f69);
+  font-size: 12px !important;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* 右键菜单 */
+.history-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 168px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 30px rgba(23, 33, 26, 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-context-menu-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.history-context-menu-item:hover:not(:disabled) {
+  background: #f1f6f3;
+}
+
+.history-context-menu-item.danger {
+  color: #b3261e;
+}
+
+.history-context-menu-item.danger:hover:not(:disabled) {
+  background: rgba(179, 38, 30, 0.08);
+}
+
+.history-context-menu-item:disabled {
+  color: #9aa6a1;
+  cursor: not-allowed;
 }
 
 .history-record-titles {
@@ -1010,8 +1076,7 @@ button.mini {
 .preview-list {
   display: grid;
   gap: 10px;
-  max-height: 520px;
-  overflow: auto;
+  /* 同样去掉内层滚动，统一交给右栏自己的滚动条管。 */
 }
 
 .preview-card {
@@ -2692,9 +2757,52 @@ h1 {
   padding: 0;
 }
 
+/* 左右栏滚动独立 + 干掉页面级的外层滚动条。
+   - body / .shell 锁死 100vh + overflow:hidden，浏览器右边那条就消失了
+   - .workspace 用 flex 填满剩余高度
+   - 两栏自己 overflow-y:auto，谁内容长谁自己滚，互不影响 */
+@media (min-width: 1100px) {
+  body {
+    height: 100vh;
+    min-height: 100vh;
+    overflow: hidden;
+  }
+  .shell {
+    height: 100vh;
+    min-height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    align-items: stretch;
+  }
+  .workspace > #fill-form.panel,
+  .workspace > .result-panel {
+    min-height: 0;
+    max-height: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    padding-right: 4px;
+  }
+  .workspace > #fill-form.panel::-webkit-scrollbar,
+  .workspace > .result-panel::-webkit-scrollbar {
+    width: 8px;
+  }
+  .workspace > #fill-form.panel::-webkit-scrollbar-thumb,
+  .workspace > .result-panel::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border-radius: 4px;
+  }
+}
+
 #fill-form {
   display: grid;
-  gap: 18px;
+  gap: 24px;
   counter-reset: none;
 }
 
@@ -2726,33 +2834,33 @@ h1 {
 .fill-mode .mode-buttons {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 26px;
+  gap: 22px;
 }
 
 .fill-mode .mode-button {
   position: relative;
-  min-height: 96px;
+  min-height: 84px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
   color: #172536;
-  padding: 20px 58px 20px 96px;
+  padding: 18px 52px 18px 84px;
   text-align: left;
-  font-size: 21px;
+  font-size: 20px;
   font-weight: 950;
   box-shadow: var(--shadow);
 }
 
 .fill-mode .mode-button::before {
   position: absolute;
-  left: 34px;
-  top: 26px;
+  left: 30px;
+  top: 22px;
   display: grid;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   place-items: center;
   color: var(--primary);
-  font-size: 34px;
+  font-size: 30px;
   line-height: 1;
 }
 
@@ -2768,13 +2876,13 @@ h1 {
 
 .fill-mode .mode-button::after {
   position: absolute;
-  left: 96px;
-  right: 54px;
-  top: 54px;
+  left: 84px;
+  right: 52px;
+  top: 48px;
   color: #7b8790;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 750;
-  line-height: 1.3;
+  line-height: 1.35;
 }
 
 #batch-fill-mode::after {
@@ -2815,7 +2923,7 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: #fff;
-  padding: 24px 28px;
+  padding: 26px 30px;
   box-shadow: var(--shadow);
 }
 
@@ -2867,8 +2975,8 @@ h1 {
 .quick-api-actions {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .quick-api-actions::before {
@@ -3021,7 +3129,8 @@ button.secondary {
 }
 
 .result-panel {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 18px;
 }
 
@@ -3037,6 +3146,7 @@ button.secondary {
   border-radius: 12px;
   background: #fff;
   box-shadow: var(--shadow);
+  flex: 0 0 auto;
 }
 
 .result-head {
@@ -3305,14 +3415,592 @@ button.secondary {
   }
 }
 
-@media (max-width: 760px) {
-  .shell {
-    width: calc(100% - 20px);
-    padding: 16px 0;
+/* ===== 共享设置（左上角） ===== */
+.share-settings-toggle {
+  position: fixed;
+  top: 18px;
+  left: 18px;
+  z-index: 50;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  color: var(--primary, #0f8f69);
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(23, 33, 26, 0.12);
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.share-settings-toggle:hover { background: #f1f6f3; transform: rotate(20deg); }
+
+.share-settings-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  justify-content: flex-start;
+  background: rgba(23, 33, 26, 0.18);
+  padding: 16px;
+}
+
+.share-settings-panel.hidden { display: none !important; }
+
+.share-settings-card {
+  width: min(520px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 22px;
+  box-shadow: 0 18px 50px rgba(23, 33, 26, 0.18);
+}
+
+.share-toggles { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 18px; }
+
+.share-toggles .checkline {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; color: var(--text);
+}
+
+.share-toggles input[type="checkbox"] { width: 16px; height: 16px; margin: 0; }
+
+.share-settings-tip { margin-top: 0; color: var(--muted); font-size: 12px; }
+
+#share-settings-status { color: var(--accent); font-size: 13px; margin-left: 8px; }
+
+/* 让 hero 给左上角齿轮腾位置，避免重叠 */
+.hero { padding-left: 60px; }
+@media (max-width: 1100px) {
+  .hero { padding-left: 56px; }
+}
+
+/* 高级设置折叠块 */
+.share-advanced {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+}
+.share-advanced > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 14px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  user-select: none;
+}
+.share-advanced > summary::-webkit-details-marker { display: none; }
+.share-advanced > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--muted);
+  transition: transform 160ms ease;
+}
+.share-advanced[open] > summary::before { transform: rotate(90deg); }
+
+.share-advanced-body {
+  padding: 6px 14px 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* ===== 历史记录批量删除 UI ===== */
+.history-head-actions { display: flex; gap: 6px; }
+
+.history-batch-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(15, 143, 105, 0.08);
+  border: 1px solid rgba(15, 143, 105, 0.18);
+  font-size: 13px;
+  color: var(--text);
+}
+.history-batch-toolbar.hidden { display: none !important; }
+.history-batch-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+#history-batch-count { font-weight: 700; }
+
+button.danger {
+  background: #b3261e;
+  color: #fff;
+  border-color: #b3261e;
+}
+button.danger:hover:not(:disabled) { background: #9b1f18; border-color: #9b1f18; }
+button.danger:disabled { background: #d8a8a4; border-color: #d8a8a4; cursor: not-allowed; }
+
+/* 选择模式下，每条卡片加左侧复选框列 */
+.history-item.selectable {
+  position: relative;
+  padding-left: 38px;
+}
+.history-item-check {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+.history-item.selected {
+  background: rgba(15, 143, 105, 0.06);
+  border-color: var(--primary, #0f8f69);
+}
+
+/* 这两张装饰说明卡（处理流程 / 温馨提示）在右栏里挤地方、还容易跟历史卡视觉打架，直接隐藏。
+   想保留就把下面这行注释掉。 */
+.result-panel > .side-card.process-card,
+.result-panel > .side-card.tips-card { display: none !important; }
+
+/* 修右键菜单红字撞红底问题：让右键菜单的 danger 项强制保持透明底 + 红字，
+   不被新加的 button.danger（红底白字，给批量删除按钮用的）覆盖。 */
+.history-context-menu .history-context-menu-item.danger {
+  background: transparent !important;
+  color: #b3261e !important;
+  border: 0 !important;
+}
+.history-context-menu .history-context-menu-item.danger:hover:not(:disabled) {
+  background: rgba(179, 38, 30, 0.08) !important;
+}
+
+/* 选择模式：整张卡变手型，悬浮加点反馈 */
+.history-item.selectable { cursor: pointer; }
+.history-item.selectable:hover { background: rgba(15, 143, 105, 0.04); }
+/* 卡内的链接 / 按钮恢复正常指针，避免误以为它们也是切换选择的 */
+.history-item.selectable a,
+.history-item.selectable button,
+.history-item.selectable input,
+.history-item.selectable label,
+.history-item.selectable summary { cursor: pointer; }
+
+/* 设置面板里的二级标题分区 */
+.share-settings-card .settings-section-title {
+  margin: 18px 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 800;
+}
+.share-settings-card .settings-section-title:first-of-type { margin-top: 6px; }
+
+/* 设置面板里"当前共享中"的预览块 */
+.share-current-summary {
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f5faf7;
+  border: 1px solid #dfe9e3;
+}
+.share-current-line {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.6;
+}
+.share-current-line + .share-current-line { margin-top: 4px; }
+
+/* Layout polish pass */
+.shell {
+  position: relative;
+  gap: 24px;
+}
+
+.hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+  padding: 28px 32px;
+  border: 1px solid rgba(15, 143, 105, 0.14);
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at top left, rgba(15, 143, 105, 0.12), transparent 34%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.96) 0%, rgba(245, 251, 248, 0.98) 52%, rgba(255, 255, 255, 0.94) 100%);
+  box-shadow: 0 28px 60px rgba(20, 33, 45, 0.08);
+  overflow: hidden;
+}
+
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(15, 143, 105, 0.24), rgba(15, 143, 105, 0));
+}
+
+.hero-main,
+.hero-copy,
+.hero-tools {
+  position: relative;
+  z-index: 1;
+}
+
+.hero-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+  min-width: 0;
+}
+
+.hero-copy {
+  min-width: 0;
+}
+
+.hero-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.hero-mark {
+  width: 78px;
+  height: 78px;
+  border-radius: 24px;
+  border: 1px solid rgba(15, 143, 105, 0.16);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(241, 250, 246, 0.92));
+  box-shadow: 0 18px 34px rgba(15, 143, 105, 0.12);
+}
+
+.hero .eyebrow {
+  margin-bottom: 10px;
+  color: #0f8f69;
+  letter-spacing: 0.18em;
+}
+
+.hero h1 {
+  max-width: min(100%, 11em);
+  margin-bottom: 12px;
+  color: #102232;
+  font-size: clamp(32px, 3.6vw, 54px);
+  line-height: 1.02;
+  white-space: normal;
+  text-wrap: balance;
+}
+
+.hero .subtle {
+  max-width: 820px;
+  color: #61717c;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.share-settings-toggle {
+  position: static;
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  border: 1px solid rgba(15, 143, 105, 0.16);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: none;
+  transition: transform 180ms ease, box-shadow 180ms ease, background 180ms ease;
+}
+
+.share-settings-toggle:hover {
+  background: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 14px 28px rgba(20, 33, 45, 0.1);
+}
+
+.user-chip {
+  min-height: 48px;
+  gap: 12px;
+  border-radius: 18px;
+  border-color: rgba(15, 143, 105, 0.14);
+  background: rgba(255, 255, 255, 0.9);
+  padding: 8px 10px 8px 14px;
+  box-shadow: none;
+}
+
+.user-chip > span {
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  grid-template-columns: minmax(0, 1.52fr) minmax(340px, 0.9fr);
+  gap: 26px;
+}
+
+#fill-form {
+  gap: 20px;
+  padding-right: 6px;
+}
+
+.common-fill-panel,
+#auto-fill-panel,
+#auto-fill-extra-panel,
+#manual-fill-panel,
+#fill-form > .field,
+.template-preview-panel,
+#fill-form > .actions,
+.results,
+.history-panel,
+.resume-panel,
+.preview-panel,
+.batch-progress,
+.generated-user-note {
+  border-radius: 20px;
+  box-shadow: 0 18px 38px rgba(20, 33, 45, 0.06);
+}
+
+.common-fill-panel,
+#auto-fill-panel,
+#auto-fill-extra-panel,
+#manual-fill-panel,
+#fill-form > .field,
+.template-preview-panel {
+  padding: 22px 24px;
+}
+
+.common-fill-panel::before,
+#auto-fill-panel::before,
+#auto-fill-extra-panel::before,
+#manual-fill-panel::before,
+.quick-api-actions::before,
+#fill-form > .field > span {
+  border-left-width: 5px;
+  padding-left: 16px;
+}
+
+.fill-mode .mode-buttons {
+  gap: 14px;
+}
+
+.fill-mode .mode-button {
+  min-height: 132px;
+  border-radius: 22px;
+  padding: 28px 30px 28px 108px;
+  font-size: 18px;
+  line-height: 1.08;
+  box-shadow: 0 16px 32px rgba(20, 33, 45, 0.06);
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.fill-mode .mode-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 40px rgba(20, 33, 45, 0.08);
+}
+
+.fill-mode .mode-button::before {
+  left: 34px;
+  top: 30px;
+}
+
+.fill-mode .mode-button::after {
+  top: 78px;
+  left: 108px;
+  right: 30px;
+  line-height: 1.4;
+}
+
+.fill-mode .mode-button.active {
+  box-shadow: 0 22px 44px rgba(15, 143, 105, 0.14);
+}
+
+#fill-form > .actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 6;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 18px 22px;
+  border: 1px solid rgba(15, 143, 105, 0.14);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(16px);
+  box-shadow:
+    0 -10px 24px rgba(20, 33, 45, 0.04),
+    0 22px 40px rgba(20, 33, 45, 0.08);
+}
+
+#fill-form > .actions > button:first-child {
+  min-width: 0;
+}
+
+#fill-form > .actions > #copy-json {
+  justify-self: start;
+}
+
+.result-panel {
+  gap: 20px;
+  padding-right: 4px;
+}
+
+.result-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  margin: 0;
+  padding: 20px 24px;
+  border: 1px solid rgba(15, 143, 105, 0.12);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 18px 34px rgba(20, 33, 45, 0.06);
+}
+
+.result-head h2 {
+  font-size: 20px;
+}
+
+#ai-status {
+  border-color: rgba(15, 143, 105, 0.16);
+  background: rgba(255, 255, 255, 0.9);
+  color: #54656f;
+  font-weight: 800;
+}
+
+.results {
+  margin-top: 0;
+  min-height: 300px;
+  padding: 24px;
+  border: 1px solid rgba(15, 143, 105, 0.1);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 252, 250, 0.94));
+}
+
+.results.empty {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 18px;
+  min-height: 330px;
+  padding: 40px 32px;
+  position: relative;
+  overflow: hidden;
+  color: #5c6d77;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.results.empty::before {
+  content: "";
+  width: 118px;
+  height: 144px;
+  border: 2px dashed rgba(164, 182, 194, 0.76);
+  border-radius: 28px;
+  background:
+    linear-gradient(135deg, transparent 0 68%, rgba(15, 143, 105, 0.12) 68% 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(245, 249, 247, 0.9));
+  box-shadow: 24px 24px 0 -8px rgba(15, 143, 105, 0.92);
+}
+
+.results.empty::after {
+  content: "";
+  position: absolute;
+  inset: auto auto -120px -80px;
+  width: 240px;
+  height: 240px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(15, 143, 105, 0.12), rgba(15, 143, 105, 0));
+  pointer-events: none;
+}
+
+#download-slot {
+  display: grid;
+  gap: 12px;
+}
+
+.history-panel {
+  display: grid;
+  grid-template-rows: auto auto auto auto minmax(220px, 1fr);
+  gap: 14px;
+  padding: 22px 24px;
+}
+
+.history-head,
+.history-filter,
+#history-status {
+  margin: 0;
+}
+
+.history-list {
+  max-height: none;
+  min-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.history-item {
+  border-radius: 16px;
+  border-color: #dbe7e1;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.66);
+}
+
+button,
+input,
+select,
+textarea {
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(15, 143, 105, 0.55);
+  box-shadow: 0 0 0 4px rgba(15, 143, 105, 0.1);
+  outline: 0;
+}
+
+button.secondary:hover {
+  background: #f7fbf9;
+}
+
+@media (max-width: 1320px) {
+  .hero {
+    grid-template-columns: 1fr;
   }
 
+  .hero h1 {
+    max-width: none;
+  }
+
+  .hero-tools {
+    justify-content: flex-start;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 820px) {
   .hero {
-    align-items: flex-start;
+    padding: 24px 20px;
+    border-radius: 22px;
+  }
+
+  .hero-main {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .hero-mark {
+    width: 68px;
+    height: 68px;
+  }
+
+  .hero h1 {
+    font-size: clamp(30px, 9vw, 44px);
   }
 
   .fill-mode .mode-buttons,
@@ -3324,103 +4012,31 @@ button.secondary {
   }
 
   .fill-mode .mode-button {
-    min-height: 90px;
-    padding-left: 78px;
+    min-height: 104px;
   }
 
-  .fill-mode .mode-button::before {
-    left: 26px;
+  #fill-form > .actions {
+    position: static;
   }
 
-  .fill-mode .mode-button::after {
-    left: 78px;
+  .common-fill-panel::before,
+  #auto-fill-panel::before,
+  #auto-fill-extra-panel::before,
+  #manual-fill-panel::before,
+  .quick-api-actions::before {
+    display: block;
+    width: 100%;
+  }
+
+  .requirements-source-mode .mode-buttons {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   #auto-fill-panel .import-actions {
     grid-column: 1;
   }
 
-  .process-card ol {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* Dashboard density alignment */
-@media (min-width: 1181px) {
-  #fill-form {
-    gap: 14px;
-  }
-
-  .common-fill-panel,
-  #auto-fill-panel,
-  #fill-form > .field,
-  .template-preview-panel,
-  #fill-form > .actions {
-    padding: 20px 26px;
-  }
-
-  .common-fill-panel {
-    gap: 14px 20px;
-  }
-
-  .common-fill-panel::before,
-  #auto-fill-panel::before,
-  #auto-fill-extra-panel::before,
-  #fill-form > .field > span,
-  .quick-api-actions::before {
-    font-size: 19px;
-  }
-
-  .quick-api-select-field {
-    grid-column: auto;
-  }
-
-  .quick-api-actions {
-    gap: 10px 12px;
-  }
-
-  #current-api-summary {
-    padding-top: 8px;
-  }
-
-  #auto-fill-panel {
-    grid-template-columns: minmax(0, 0.95fr) minmax(0, 1fr);
-    gap: 14px 20px;
-  }
-
-  .requirements-source-mode {
-    grid-column: 1;
-    grid-row: 2 / span 2;
-    align-self: start;
-  }
-
-  #auto-fill-panel > .field.requirements-link-source,
-  #auto-fill-panel > .field.requirements-text-source {
-    grid-column: 2;
-    grid-row: 2;
-  }
-
-  #auto-fill-panel > .import-actions.requirements-text-source {
-    grid-column: 2;
-    grid-row: 3;
-    align-self: start;
-  }
-
-  #auto-fill-panel > .import-actions.requirements-text-source button {
-    min-width: 170px;
-  }
-
-  input,
-  select,
-  button {
-    min-height: 42px;
-  }
-
-  #fill-form > .field {
-    gap: 10px;
-  }
-
-  #fill-form > .actions {
-    min-height: 82px;
+  .history-panel {
+    grid-template-rows: auto auto auto auto minmax(180px, 1fr);
   }
 }

@@ -8,7 +8,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import threading
 import time
 import uuid
 import zipfile
@@ -36,9 +35,6 @@ CONFIG_PATH = CONFIG_DIR / "api-config.json"
 USERS_PATH = CONFIG_DIR / "users.json"
 AUTH_SETTINGS_PATH = CONFIG_DIR / "auth-settings.json"
 HISTORY_PATH = CONFIG_DIR / "generation-history.json"
-SHARE_SETTINGS_PATH = CONFIG_DIR / "share-settings.json"
-# admin 账号默认就是 host。要换 host 改 HOST_USERNAME 环境变量即可。
-HOST_USERNAME = os.getenv("HOST_USERNAME", "admin").strip() or "admin"
 DOWNLOAD_CACHE_DIR = CONFIG_DIR / "download-cache"
 RESUME_JOBS_DIR = CONFIG_DIR / "resume-jobs"
 DEFAULT_TEMPLATE_PATH = BASE_DIR / "templates_docx" / "default-training-log.docx"
@@ -51,19 +47,6 @@ OPENAI_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS",
 OLLAMA_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "900") or "900")
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_TASKS: dict[str, asyncio.Task[Any]] = {}
-# 多用户并发：FastAPI 是单进程 asyncio，多个生成任务天然并行，但有两处共享状态需要保护：
-# 1) 历史文件（generation-history.json）是“读—改—写”，并发会丢条目，加进程内锁。
-# 2) 同时进行的批量生成数量需要有上限，避免本地模型/远端 API 被打爆。1-4 名同学合用一台机。
-MAX_CONCURRENT_BATCH_JOBS = int(os.getenv("MAX_CONCURRENT_BATCH_JOBS", "4") or "4")
-_HISTORY_FILE_LOCK = threading.Lock()
-BATCH_SLOTS: asyncio.Semaphore | None = None
-
-
-def get_batch_slots() -> asyncio.Semaphore:
-    global BATCH_SLOTS
-    if BATCH_SLOTS is None:
-        BATCH_SLOTS = asyncio.Semaphore(max(1, MAX_CONCURRENT_BATCH_JOBS))
-    return BATCH_SLOTS
 
 app = FastAPI(title="AI Document Form Filler")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -159,233 +142,6 @@ async def list_generation_history(request: Request, writer: str = "", limit: int
         "auth_required": is_auth_required(),
         "current_user": public_user(user),
     }
-
-
-
-@app.get("/api/share-settings")
-async def get_share_settings(request: Request) -> dict[str, Any]:
-    """共享设置：host 看到完整内容，其他人只看到布尔开关 + 自己有权读到的内容。"""
-    user = require_current_user(request)
-    settings = load_share_settings()
-    is_host = is_host_user(user)
-    response = {
-        "is_host": is_host,
-        "host_username": settings["host_username"],
-        "share_api": bool(settings.get("share_api", True)),
-        "share_prompt": bool(settings.get("share_prompt", True)),
-        "share_skills": bool(settings.get("share_skills", True)),
-    }
-    if is_host:
-        # host 自己看完整内容才能编辑
-        response["shared_prompt"] = settings.get("shared_prompt", "")
-        response["shared_skills"] = settings.get("shared_skills", "")
-    return response
-
-
-@app.post("/api/share-settings")
-async def save_share_settings_endpoint(payload: dict[str, Any], request: Request) -> dict[str, Any]:
-    user = require_current_user(request)
-    if not is_host_user(user):
-        raise HTTPException(status_code=403, detail="只有 host 账号能修改共享设置。")
-    current = load_share_settings()
-    current["share_api"] = bool(payload.get("share_api", current["share_api"]))
-    current["share_prompt"] = bool(payload.get("share_prompt", current["share_prompt"]))
-    current["share_skills"] = bool(payload.get("share_skills", current["share_skills"]))
-    if isinstance(payload.get("shared_prompt"), str):
-        current["shared_prompt"] = payload["shared_prompt"]
-    if isinstance(payload.get("shared_skills"), str):
-        current["shared_skills"] = payload["shared_skills"]
-    # 整组预设列表：校验下结构后存
-    if isinstance(payload.get("shared_prompt_presets"), list):
-        current["shared_prompt_presets"] = [
-            {"name": str(p.get("name", "")).strip(), "prompt": str(p.get("prompt", ""))}
-            for p in payload["shared_prompt_presets"]
-            if isinstance(p, dict) and str(p.get("name", "")).strip()
-        ]
-    if isinstance(payload.get("shared_skills_presets"), list):
-        current["shared_skills_presets"] = [
-            {"name": str(p.get("name", "")).strip(), "skills": str(p.get("skills", ""))}
-            for p in payload["shared_skills_presets"]
-            if isinstance(p, dict) and str(p.get("name", "")).strip()
-        ]
-    save_share_settings(current)
-    return {"saved": True}
-
-
-@app.get("/api/shared-defaults")
-async def get_shared_defaults(request: Request) -> dict[str, Any]:
-    """非 host 用户进来时拉这个端点，前端按开关情况预填字段。"""
-    user = require_current_user(request)
-    settings = load_share_settings()
-    is_host = is_host_user(user)
-    bundle: dict[str, Any] = {
-        "is_host": is_host,
-        "host_username": settings["host_username"],
-        "shared_fields": [],
-    }
-    if is_host:
-        # host 本人不用预填，自己就是源头
-        return bundle
-    if settings.get("share_prompt"):
-        if settings.get("shared_prompt"):
-            bundle["custom_prompt"] = settings["shared_prompt"]
-            bundle["shared_fields"].append("custom_prompt")
-        if settings.get("shared_prompt_presets"):
-            bundle["shared_prompt_presets"] = settings["shared_prompt_presets"]
-            bundle["shared_fields"].append("shared_prompt_presets")
-    if settings.get("share_skills"):
-        if settings.get("shared_skills"):
-            bundle["custom_skills"] = settings["shared_skills"]
-            bundle["shared_fields"].append("custom_skills")
-        if settings.get("shared_skills_presets"):
-            bundle["shared_skills_presets"] = settings["shared_skills_presets"]
-            bundle["shared_fields"].append("shared_skills_presets")
-    if settings.get("share_api"):
-        host_api = host_api_config()
-        # host 的 api key 也分享出去，让别人不用挨个填
-        if host_api:
-            bundle["api_config"] = {
-                "format": host_api.get("format", ""),
-                "base_url": host_api.get("base_url", ""),
-                "api_key": host_api.get("api_key", ""),
-                "model": host_api.get("model", ""),
-                "gpu_model": host_api.get("gpu_model", ""),
-            }
-            bundle["shared_fields"].append("api_config")
-    return bundle
-
-
-@app.delete("/api/recovered/{recovered_id}")
-async def delete_recovered_output(recovered_id: str, request: Request) -> dict[str, Any]:
-    """从磁盘上删除一个找回项（outputs/ 下的文件夹或文件）。
-
-    找回项的 id 形如 discovered-<16位 sha1 前缀>，由 discovered_output_entry() 用
-    sha1(str(path)) 算出。我们直接遍历 OUTPUT_DIR，找出 sha1 匹配的那一项再删。
-    """
-    require_current_user(request)
-    if not recovered_id.startswith("discovered-"):
-        raise HTTPException(status_code=400, detail="只能用这个接口删除找回项。")
-    target_hash = recovered_id[len("discovered-"):]
-    if not target_hash:
-        raise HTTPException(status_code=400, detail="找回项 id 不合法。")
-    if not OUTPUT_DIR.exists():
-        raise HTTPException(status_code=404, detail="outputs 目录不存在。")
-    target_path: Path | None = None
-    for child in OUTPUT_DIR.iterdir():
-        h = hashlib.sha1(str(child).encode("utf-8")).hexdigest()[:16]
-        if h == target_hash:
-            target_path = child
-            break
-    if target_path is None:
-        raise HTTPException(status_code=404, detail="找不到对应的文件/文件夹，可能已被删除。")
-    # 强校验：必须落在 OUTPUT_DIR 下，避免被构造 id 删到别的目录
-    try:
-        resolved = target_path.resolve()
-        if OUTPUT_DIR.resolve() not in resolved.parents and resolved != OUTPUT_DIR.resolve():
-            raise HTTPException(status_code=400, detail="路径不合法。")
-    except OSError:
-        raise HTTPException(status_code=500, detail="无法解析路径。")
-    try:
-        if target_path.is_dir():
-            shutil.rmtree(target_path)
-        else:
-            target_path.unlink(missing_ok=True)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"删除失败：{exc}")
-    return {"deleted": True, "id": recovered_id, "path": str(target_path)}
-
-
-@app.post("/api/history/delete-batch")
-async def delete_generation_history_batch(payload: dict[str, Any], request: Request) -> dict[str, Any]:
-    """批量删除历史记录。
-    payload: {"ids": ["...", "discovered-...", ...]}
-
-    - 普通历史 id（不以 discovered- 开头）：从 history JSON 移除
-    - 找回项 id（discovered-xxxx）：从 outputs/ 真删对应的文件夹/文件
-    返回每一项的处理结果。
-    """
-    user = require_current_user(request)
-    ids = payload.get("ids") if isinstance(payload, dict) else None
-    if not isinstance(ids, list) or not ids:
-        raise HTTPException(status_code=400, detail="ids 不能为空。")
-    # 去重 + 字符串化
-    ids = list(dict.fromkeys(str(x) for x in ids if x))
-
-    # 1) 把 discovered-* 和普通 id 分开
-    discovered_ids = [eid for eid in ids if eid.startswith("discovered-")]
-    regular_ids = [eid for eid in ids if not eid.startswith("discovered-")]
-
-    print(f"[delete-batch] user={user.get('username')} total={len(ids)} discovered={len(discovered_ids)} regular={len(regular_ids)}", flush=True)
-    print(f"[delete-batch] first few ids: {ids[:5]}", flush=True)
-
-    results: list[dict[str, Any]] = []
-
-    # 2) 找回项：扫一次 OUTPUT_DIR 建 hash -> path 索引，避免每个 id 都扫一次
-    if discovered_ids and OUTPUT_DIR.exists():
-        index: dict[str, Path] = {}
-        for child in OUTPUT_DIR.iterdir():
-            h = hashlib.sha1(str(child).encode("utf-8")).hexdigest()[:16]
-            index[h] = child
-        print(f"[delete-batch] OUTPUT_DIR has {len(index)} entries, sample: {list(index.items())[:3]}", flush=True)
-        print(f"[delete-batch] discovered hashes we want: {[eid[len('discovered-'):] for eid in discovered_ids[:5]]}", flush=True)
-        for eid in discovered_ids:
-            target_hash = eid[len("discovered-"):]
-            target = index.get(target_hash)
-            if target is None:
-                results.append({"id": eid, "ok": False, "reason": "not_found"})
-                continue
-            try:
-                resolved = target.resolve()
-                root = OUTPUT_DIR.resolve()
-                if root not in resolved.parents and resolved != root:
-                    results.append({"id": eid, "ok": False, "reason": "outside_outputs"})
-                    continue
-                if target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink(missing_ok=True)
-                results.append({"id": eid, "ok": True})
-            except OSError as exc:
-                results.append({"id": eid, "ok": False, "reason": str(exc)})
-    elif discovered_ids:
-        for eid in discovered_ids:
-            results.append({"id": eid, "ok": False, "reason": "outputs_missing"})
-
-    # 3) 普通历史 id：一次性 load + 过滤 + save，避免多次写文件
-    if regular_ids:
-        regular_set = set(regular_ids)
-        with _HISTORY_FILE_LOCK:
-            items = load_generation_history()
-            kept: list[dict[str, Any]] = []
-            removed_ids: set[str] = set()
-            for item in items:
-                item_id = str(item.get("id") or "")
-                if item_id in regular_set and can_view_history_entry(item, user):
-                    removed_ids.add(item_id)
-                    continue
-                kept.append(item)
-            if removed_ids:
-                save_generation_history(kept)
-        for eid in regular_ids:
-            results.append({"id": eid, "ok": eid in removed_ids, "reason": "" if eid in removed_ids else "not_found_or_forbidden"})
-
-    total_ok = sum(1 for r in results if r["ok"])
-    fails = [r for r in results if not r["ok"]]
-    print(f"[delete-batch] done. ok={total_ok}/{len(ids)} failed={len(fails)} sample_fail={fails[:3]}", flush=True)
-    return {"deleted": total_ok, "total": len(ids), "results": results}
-
-
-@app.delete("/api/history/{entry_id}")
-async def delete_generation_history(entry_id: str, request: Request) -> dict[str, Any]:
-    """删除单条历史记录（不删除磁盘上的文档文件本身）。"""
-    user = require_current_user(request)
-    if str(entry_id).startswith("discovered-"):
-        # discovered-* 是扫描 outputs/ 目录生成的“找回项”，不在历史 JSON 里，无法删除。
-        raise HTTPException(status_code=400, detail="找回项不能从历史里删除，请直接清理输出目录。")
-    removed = delete_generation_history_entry(entry_id, user)
-    if not removed:
-        raise HTTPException(status_code=404, detail="历史记录不存在或没有权限删除。")
-    return {"deleted": True, "id": entry_id}
 
 
 @app.get("/api/config")
@@ -604,7 +360,6 @@ async def create_fill_job(
     api_base_url: str = Form(""),
     api_key: str = Form(""),
     api_model: str = Form(""),
-    parallel_count: int = Form(2),
 ) -> dict[str, Any]:
     user = require_current_user(request)
     saved_path, original_filename = await resolve_template_file(file)
@@ -614,9 +369,6 @@ async def create_fill_job(
         fields = extract_docx_template_fields(saved_path)
     if not fields:
         fields = default_training_log_fields()
-
-    # 并发度限制在 1–4 之间。前端会传 1/2/3/4，超出范围安全裁剪。
-    parallel_count = max(1, min(4, int(parallel_count or 1)))
 
     records = parse_selected_records(selected_records)
     if not records:
@@ -637,7 +389,6 @@ async def create_fill_job(
         "selected_modules": parse_selected_modules(selected_modules),
         "link_module_teacher": link_module_teacher,
         "module_teacher_map": build_module_teacher_map(module_teacher_map, module_a_teacher, module_b_teacher, module_c_teacher),
-        "parallel_count": parallel_count,
     }
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
@@ -654,7 +405,6 @@ async def create_fill_job(
         "poll_interval_ms": job_poll_interval_ms(api_config),
         "result": None,
         "error": "",
-        "parallel_count": parallel_count,
     }
     resume_state = create_resume_job_state(
         job_id,
@@ -745,22 +495,10 @@ async def discard_resume_job(job_id: str, request: Request) -> dict[str, Any]:
     state = load_resume_job(job_id)
     if not state or not can_view_resume_job(state, user):
         raise HTTPException(status_code=404, detail="任务不存在。")
-    # 正在跑的任务先取消，再删，避免删掉之后任务还在写文件造成混乱。
-    task = JOB_TASKS.get(job_id)
-    if job_id in JOBS and JOBS[job_id].get("status") == "running" and task and not task.done():
-        JOBS[job_id]["cancel_requested"] = True
-        task.cancel()
-    # 真正从磁盘上删掉这个 resume-job 的 state JSON，列表里就看不到了。
-    # 已生成的文件夹（output_folder）保留，避免误删用户已经成功的产物。
-    path = resume_job_path(job_id)
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        # 退化方案：删不了文件就标成 discarded，前端依然会过滤掉。
-        state["status"] = "discarded"
-        state["message"] = "已忽略这个未完成任务。"
-        save_resume_job(state)
-    return {"ok": True, "deleted": True, "id": job_id}
+    state["status"] = "discarded"
+    state["message"] = "已忽略这个未完成任务。"
+    save_resume_job(state)
+    return {"ok": True}
 
 
 @app.post("/api/models")
@@ -849,7 +587,7 @@ async def download_file(filename: str, request: Request) -> FileResponse:
 @app.get("/download-folder/{folder}/{filename}")
 async def download_folder_file(folder: str, filename: str, request: Request) -> FileResponse:
     require_current_user(request)
-    if not re.fullmatch(r"[\w\u4e00-\u9fff. \-]+", folder):
+    if not re.fullmatch(r"[a-f0-9]{32}(?:-[\w\u4e00-\u9fff.-]+)?", folder):
         raise HTTPException(status_code=404, detail="File not found.")
     if not re.fullmatch(r"[\w\u4e00-\u9fff .-]+\.(docx|pdf)", filename):
         raise HTTPException(status_code=404, detail="File not found.")
@@ -1362,79 +1100,6 @@ def safe_config_name(value: str) -> str:
     return safe or "user"
 
 
-
-def load_share_settings() -> dict[str, Any]:
-    """读取共享设置。默认 host 只共享自己的 prompt/skills/api，开关全部 true。"""
-    defaults = {
-        "host_username": HOST_USERNAME,
-        "share_api": True,
-        "share_prompt": True,
-        "share_skills": True,
-        "shared_prompt": "",
-        "shared_skills": "",
-        # 整组预设列表（自定义、非内置的）
-        "shared_prompt_presets": [],  # [{"name": "...", "prompt": "..."}]
-        "shared_skills_presets": [],  # [{"name": "...", "skills": "..."}]
-    }
-    if not SHARE_SETTINGS_PATH.exists():
-        return defaults
-    try:
-        data = json.loads(SHARE_SETTINGS_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return defaults
-    except (json.JSONDecodeError, OSError):
-        return defaults
-    merged = dict(defaults)
-    merged.update({k: v for k, v in data.items() if k in defaults})
-    merged["host_username"] = defaults["host_username"]
-    # 校验列表
-    if not isinstance(merged.get("shared_prompt_presets"), list):
-        merged["shared_prompt_presets"] = []
-    if not isinstance(merged.get("shared_skills_presets"), list):
-        merged["shared_skills_presets"] = []
-    return merged
-
-
-def save_share_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    SHARE_SETTINGS_PATH.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return settings
-
-
-def is_host_user(user: dict[str, str] | None) -> bool:
-    if not user:
-        return False
-    username = str(user.get("username") or "")
-    if username == HOST_USERNAME:
-        return True
-    # 免登录模式下，本机的 guest 即视为 host（一台机器只有一个 guest，自然是这台机的"主人"）。
-    # 这样不用建 admin 账号就能控制共享设置。
-    if username == "guest" and not is_auth_required():
-        return True
-    return False
-
-
-def host_api_config() -> dict[str, str]:
-    # 优先用 HOST_USERNAME 的配置；如果不存在（比如免登录模式下没建 admin 账号），
-    # 退一步用 guest 的配置——免登录模式下 guest 就是 host。
-    candidates = [HOST_USERNAME]
-    if not is_auth_required() and "guest" not in candidates:
-        candidates.append("guest")
-    for username in candidates:
-        path = api_config_path_for_user(username)
-        if not path.exists():
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        if isinstance(data, dict) and data:
-            return data
-    return {}
-
-
 def load_generation_history() -> list[dict[str, Any]]:
     if not HISTORY_PATH.exists():
         return []
@@ -1459,29 +1124,9 @@ def save_generation_history(items: list[dict[str, Any]]) -> None:
 
 
 def append_generation_history(entry: dict[str, Any]) -> dict[str, Any]:
-    # 多用户并发时，先 load 再 save 会丢条目；用一个进程内锁串行掉。
-    with _HISTORY_FILE_LOCK:
-        history = [entry] + [item for item in load_generation_history() if item.get("id") != entry.get("id")]
-        save_generation_history(history)
+    history = [entry] + [item for item in load_generation_history() if item.get("id") != entry.get("id")]
+    save_generation_history(history)
     return entry
-
-
-def delete_generation_history_entry(entry_id: str, user: dict[str, str]) -> bool:
-    """删除单条历史记录。返回是否真的删除了一条。"""
-    if not entry_id:
-        return False
-    with _HISTORY_FILE_LOCK:
-        items = load_generation_history()
-        kept: list[dict[str, Any]] = []
-        removed = False
-        for item in items:
-            if str(item.get("id") or "") == entry_id and can_view_history_entry(item, user):
-                removed = True
-                continue
-            kept.append(item)
-        if removed:
-            save_generation_history(kept)
-    return removed
 
 
 def utc_now_iso() -> str:
@@ -1530,7 +1175,7 @@ def list_resume_jobs_for_user(user: dict[str, str]) -> list[dict[str, Any]]:
             continue
         completed = int(state.get("completed") or len(state.get("generated_records") or []))
         total = int(state.get("total") or len(state.get("selected_records") or []))
-        if total <= 0 or completed >= total or state.get("status") in ("complete", "discarded"):
+        if total <= 0 or completed >= total or state.get("status") == "complete":
             continue
         jobs.append(public_resume_job(state))
     jobs.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -1589,9 +1234,7 @@ def create_resume_job_state(
     request_context: dict[str, str],
 ) -> dict[str, Any]:
     title = package_title_for_records(selected_records) if selected_records else "批量训练日志"
-    # 文件夹名走"可读风格"：6.1-6.9 张三；碰撞时 unique_output_folder 加 -2/-3。
-    folder_base = friendly_folder_name(selected_records, str(defaults.get("default_writer") or "")) if selected_records else "批量训练日志"
-    output_folder = unique_output_folder(folder_base)
+    output_folder = OUTPUT_DIR / f"{job_id}-{safe_filename(title)}"
     output_folder.mkdir(parents=True, exist_ok=True)
     state = {
         "version": 1,
@@ -1697,7 +1340,6 @@ def resume_job_to_run_args(state: dict[str, Any], api_config: dict[str, str] | N
             "selected_modules": defaults.get("selected_modules") if isinstance(defaults.get("selected_modules"), list) else [],
             "link_module_teacher": bool(defaults.get("link_module_teacher")),
             "module_teacher_map": defaults.get("module_teacher_map") if isinstance(defaults.get("module_teacher_map"), dict) else {},
-            "parallel_count": max(1, min(4, int(defaults.get("parallel_count") or 1))),
         },
         "custom_prompt": str(state.get("custom_prompt") or ""),
         "custom_skills": str(state.get("custom_skills") or ""),
@@ -1890,12 +1532,10 @@ def summarize_history_stats(payload: dict[str, Any], records: list[dict[str, Any
         if isinstance(stats, dict):
             stats_items.append(stats)
     if not stats_items:
-        return {"duration_seconds": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        return {"duration_seconds": 0, "total_tokens": 0}
     return {
         "duration_seconds": round(sum(float(item.get("duration_seconds") or 0) for item in stats_items), 2),
         "total_tokens": sum(int(item.get("total_tokens") or 0) for item in stats_items),
-        "input_tokens": sum(int(item.get("input_tokens") or 0) for item in stats_items),
-        "output_tokens": sum(int(item.get("output_tokens") or 0) for item in stats_items),
         "token_source": stats_items[0].get("token_source", ""),
     }
 
@@ -2080,7 +1720,7 @@ def discovered_output_entry(path: Path, downloads: list[dict[str, str]], count: 
         "folder_path": output_folder_display_path(path) if path.is_dir() else "",
         "folder_zip_url": "",
         "record_titles": [],
-        "stats": {"duration_seconds": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
+        "stats": {"duration_seconds": 0, "total_tokens": 0},
         "recovered": True,
     }
 
@@ -2302,29 +1942,8 @@ async def run_fill_job(
     if output_folder and output_folder.exists():
         used_names.update(child.name for child in output_folder.iterdir() if child.is_file())
     used_ai = can_use_ai(api_config)
-    # 续写跳篇修复：之前直接 start = len(generated_records)，但 state.completed 有可能因为
-    # 多次 save_resume_job / 任务被强制 kill 等情况，比 generated_records 实际个数更大（少了一条）。
-    # 这里取两者的最小值，确保不会跳过任何 selected_records[i]。即使代价是重做最后一篇，
-    # 也比漏掉一篇好。
-    completed_recorded = int((resume_state or {}).get("completed") or 0)
-    actual_done = len(generated_records)
-    if completed_recorded > actual_done:
-        # 说明 state 标记的进度比实际写的多——有一条被记成完成但 record 没存下。
-        # 把 completed 拉回到实际值，避免跳过下一条。
-        completed_recorded = actual_done
-    start_index = min(min(actual_done, completed_recorded), len(selected_records))
+    start_index = min(len(generated_records), len(selected_records))
     job["completed"] = start_index
-    # 多用户并发：最多同时跑 MAX_CONCURRENT_BATCH_JOBS 个批量任务，超出的排队等待。
-    slots = get_batch_slots()
-    slot_acquired = False
-    if used_ai:
-        queued_msg = job.get("message")
-        if slots.locked():
-            job["message"] = "已排队，等待其他用户的生成完成..."
-        await slots.acquire()
-        slot_acquired = True
-        if queued_msg is not None:
-            job["message"] = queued_msg
     try:
         if resume_state:
             resume_state["status"] = "running"
@@ -2332,87 +1951,62 @@ async def run_fill_job(
             resume_state["api_config"] = sanitize_resume_api_config(api_config)
             resume_state["completed"] = start_index
             save_resume_job(resume_state)
-        # 并行生成：按 parallel_count 分块处理 selected_records，
-        # 每块内 AI 调用 asyncio.gather 并行；块内 AI 结果按原顺序写文件、追加到 generated_records，
-        # 保证 resume 状态依然按 selected_records 的顺序对齐。
-        parallel = max(1, min(4, int(defaults.get("parallel_count") or 1)))
-        pending = list(enumerate(selected_records[start_index:], start=start_index + 1))
-
-        async def _ai_one(record_in: dict[str, Any]) -> dict[str, Any]:
-            result = await generate_selected_records_one_by_one(
-                document_text,
-                requirements_text,
-                [record_in],
-                fields,
-                api_config,
-                custom_prompt,
-                custom_skills,
-            )
-            return result["records"][0] if result.get("records") else record_in
-
-        while pending:
+        for index, selected_record in enumerate(selected_records[start_index:], start=start_index + 1):
             if job.get("cancel_requested"):
                 raise asyncio.CancelledError()
-            chunk = pending[:parallel]
-            pending = pending[parallel:]
-            first_title = str(chunk[0][1].get("title") or f"training-log-{chunk[0][0]}")
-            job["current"] = first_title
-            if parallel > 1 and len(chunk) > 1:
-                job["message"] = f"并行生成第 {chunk[0][0]}–{chunk[-1][0]}/{len(selected_records)} 篇..."
-            else:
-                job["message"] = f"正在生成第 {chunk[0][0]}/{len(selected_records)} 篇：{first_title}"
+            title = str(selected_record.get("title") or f"training-log-{index}")
+            job["current"] = title
+            job["message"] = f"正在生成第 {index}/{len(selected_records)} 篇：{title}"
             if resume_state:
-                resume_state["current"] = first_title
+                resume_state["current"] = title
                 resume_state["message"] = job["message"]
                 save_resume_job(resume_state)
             if used_ai:
-                ai_records = await asyncio.gather(*[_ai_one(sr) for _, sr in chunk])
-            else:
-                ai_records = []
-                for _, sr in chunk:
-                    rec = sr
-                    rec["generation_stats"] = fallback_generation_stats(0)
-                    ai_records.append(rec)
-            # AI 调用全部返回后，按块内原顺序串行写文件，避免 used_names / generated_paths 竞态。
-            for (index, _selected_record), record in zip(chunk, ai_records):
-                if job.get("cancel_requested"):
-                    raise asyncio.CancelledError()
-                apply_plan_defaults(
-                    [record],
-                    defaults["start_date"],
-                    defaults["default_coach"],
-                    defaults["default_writer"],
-                    defaults["selected_modules"],
-                    defaults["link_module_teacher"],
-                    defaults["module_teacher_map"],
+                result = await generate_selected_records_one_by_one(
+                    document_text,
+                    requirements_text,
+                    [selected_record],
+                    fields,
+                    api_config,
+                    custom_prompt,
+                    custom_skills,
                 )
-                record["answers"] = enrich_answers_for_fields(record.get("answers", []), fields)
-                output_title = record_file_title(record, index)
-                output_path = fill_docx_template(template_path, record.get("answers", []), output_title)
-                output_path = convert_output_format(output_path, output_format)
-                file_name = unique_package_filename(f"{safe_filename(output_title)}{output_path.suffix}", used_names)
-                if output_folder:
-                    target_path = output_folder / file_name
-                    shutil.copy2(output_path, target_path)
-                    cleanup_packaged_temp_outputs([output_path])
-                else:
-                    generated_paths.append((output_path, file_name))
-                generated_records.append(record)
-            # 块整体完成后再统一刷状态、写盘，比每篇都写一次更省。
-            last_index = chunk[-1][0]
-            last_title = str(chunk[-1][1].get("title") or f"training-log-{last_index}")
-            job["completed"] = last_index
-            job["current"] = last_title
-            job["message"] = f"已写入第 {last_index}/{len(selected_records)} 篇：{last_title}"
+                record = result["records"][0] if result["records"] else selected_record
+            else:
+                record = selected_record
+                record["generation_stats"] = fallback_generation_stats(0)
+            apply_plan_defaults(
+                [record],
+                defaults["start_date"],
+                defaults["default_coach"],
+                defaults["default_writer"],
+                defaults["selected_modules"],
+                defaults["link_module_teacher"],
+                defaults["module_teacher_map"],
+            )
+            record["answers"] = enrich_answers_for_fields(record.get("answers", []), fields)
+            output_title = record_file_title(record, index)
+            output_path = fill_docx_template(template_path, record.get("answers", []), output_title)
+            output_path = convert_output_format(output_path, output_format)
+            file_name = unique_package_filename(f"{safe_filename(output_title)}{output_path.suffix}", used_names)
+            if output_folder:
+                target_path = output_folder / file_name
+                shutil.copy2(output_path, target_path)
+                cleanup_packaged_temp_outputs([output_path])
+            else:
+                generated_paths.append((output_path, file_name))
+            generated_records.append(record)
+            job["completed"] = index
+            job["message"] = f"已写入第 {index}/{len(selected_records)} 篇：{title}"
             if resume_state:
-                resume_state["completed"] = last_index
+                resume_state["completed"] = index
                 resume_state["generated_records"] = generated_records
                 resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
                 resume_state["message"] = job["message"]
                 save_resume_job(resume_state)
 
         job["message"] = "正在整理下载文件..."
-        package_path = output_folder if output_folder else write_generated_package(generated_paths, generated_records, output_package_mode, defaults.get("default_writer", ""))
+        package_path = output_folder if output_folder else write_generated_package(generated_paths, generated_records, output_package_mode)
         job["status"] = "complete"
         job["message"] = "批量生成完成。"
         job["result"] = {
@@ -2522,9 +2116,6 @@ async def run_fill_job(
                 api_config,
                 output_format,
             )
-    finally:
-        if slot_acquired:
-            slots.release()
 
 
 def attach_partial_batch_result(
@@ -2544,7 +2135,7 @@ def attach_partial_batch_result(
 ) -> None:
     if not generated_paths or not generated_records:
         return
-    package_path = write_generated_package(generated_paths, generated_records, output_package_mode, default_writer)
+    package_path = write_generated_package(generated_paths, generated_records, output_package_mode)
     job["partial_result"] = {
         "filename": original_filename,
         "used_ai": used_ai,
@@ -2576,14 +2167,8 @@ def attach_partial_batch_result(
     job["message"] = f"{job.get('message') or '批量生成失败'} 已导出 {len(generated_records)} 个已完成文件。"
 
 
-def write_generated_package(
-    generated_paths: list[tuple[Path, str]],
-    records: list[dict[str, Any]],
-    package_mode: str,
-    writer: str = "",
-) -> Path:
-    # 用友好命名（6.1-6.9 张三）；没有 writer 就只剩日期段。
-    root_folder = friendly_folder_name(records, writer) if records else safe_filename(package_title_for_records(records))
+def write_generated_package(generated_paths: list[tuple[Path, str]], records: list[dict[str, Any]], package_mode: str) -> Path:
+    root_folder = safe_filename(package_title_for_records(records))
     if normalize_package_mode(package_mode) == "folder":
         folder_path = unique_output_folder(root_folder)
         folder_path.mkdir(parents=True, exist_ok=False)
@@ -2609,13 +2194,11 @@ def normalize_package_mode(package_mode: str) -> str:
 
 
 def unique_output_folder(root_folder: str) -> Path:
-    """输出文件夹命名：清爽风格（"6.1-6.9 张三"），不再带 uuid 前缀。
-    碰到同名就追加 -2 / -3 后缀，永不覆盖已经生成好的内容。"""
     base_name = safe_filename(root_folder) or "training-logs"
-    candidate = OUTPUT_DIR / base_name
+    candidate = OUTPUT_DIR / f"{uuid.uuid4().hex}-{base_name}"
     counter = 2
     while candidate.exists():
-        candidate = OUTPUT_DIR / f"{base_name}-{counter}"
+        candidate = OUTPUT_DIR / f"{uuid.uuid4().hex}-{base_name}-{counter}"
         counter += 1
     return candidate
 
@@ -3363,6 +2946,22 @@ async def call_openai_compatible(
     return {"used_ai": True, "answers": answers, "generation_stats": raw_result["generation_stats"]}
 
 
+def fallback_record_from_selected(record: dict[str, Any], fields: list[dict[str, Any]], index: int, reason: str) -> dict[str, Any]:
+    answers = record.get("answers", [])
+    if not isinstance(answers, list):
+        answers = []
+    module = answer_list_value(answers, ["训练模块", "模块"])
+    plan = answer_list_value(answers, ["训练任务", "训练计划"]) or str(record.get("title") or "训练任务")
+    fallback = build_training_record(module, plan, fields, index)
+    fallback["title"] = str(record.get("title") or fallback.get("title") or f"training-log-{index}")
+    for answer in fallback.get("answers", []):
+        answer["reason"] = f"本地兜底生成：{reason}"
+    for existing in normalize_answers(answers):
+        if existing.get("value"):
+            set_record_answer(fallback, existing["name"], existing["value"], existing.get("confidence", 0.7), existing.get("reason", "自动生成。"))
+    return fallback
+
+
 async def call_openai_compatible_raw(base_url: str, api_key: str, model: str, prompt: str) -> str:
     result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
     return result["content"]
@@ -3456,6 +3055,11 @@ def ollama_headers(api_key: str = "") -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
+async def call_ollama_raw(base_url: str, model: str, prompt: str, api_key: str = "") -> str:
+    result = await call_ollama_raw_with_stats(base_url, model, prompt, api_key)
+    return result["content"]
+
+
 async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
     started = time.perf_counter()
     try:
@@ -3473,10 +3077,11 @@ async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api
                 json={
                     "model": model,
                     "stream": False,
+                    "format": "json",
                     "messages": [
                         {
                             "role": "system",
-                            "content": "请根据输入生成训练日志内容。只返回合法 JSON，不要返回解释、Markdown 代码块或 <think> 内容。",
+                            "content": "请根据输入生成训练日志内容。",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -3509,15 +3114,6 @@ async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api
         (float(payload.get("total_duration") or 0) / 1_000_000_000)
         or float(payload.get("duration_seconds") or 0)
         or (time.perf_counter() - started)
-    )
-    load_s = round(float(payload.get("load_duration") or 0) / 1_000_000_000, 2)
-    prompt_eval_s = round(float(payload.get("prompt_eval_duration") or 0) / 1_000_000_000, 2)
-    eval_s = round(float(payload.get("eval_duration") or 0) / 1_000_000_000, 2)
-    print(
-        f"[ollama timing] model={model} "
-        f"load={load_s}s prompt_eval={prompt_eval_s}s eval={eval_s}s total={round(duration_seconds,2)}s "
-        f"prompt_tokens={payload.get('prompt_eval_count')} gen_tokens={payload.get('eval_count')}",
-        flush=True,
     )
     has_usage = bool(usage.get("prompt_eval_count") or usage.get("eval_count") or usage.get("total_tokens"))
     token_source = str(payload.get("token_source") or ("api" if has_usage else "estimated"))
@@ -3772,6 +3368,11 @@ def is_invalid_ai_json_error(exc: HTTPException) -> bool:
     return exc.status_code == 502 and "invalid" in detail.lower() and "json" in detail.lower()
 
 
+def clean_json_content(content: str) -> str:
+    candidates = json_text_candidates(content)
+    return candidates[0] if candidates else str(content or "").strip()
+
+
 def json_text_candidates(content: str) -> list[str]:
     content = normalize_json_source(content)
     if not content:
@@ -3832,12 +3433,19 @@ def build_prompt(
 ) -> str:
     return json.dumps(
         {
-            "task": "请根据输入生成训练日志内容。",
+            "task": (
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+                "请根据输入生成训练日志内容。",
+            ),
             "output_format": {
                 "answers": [
                     {
                         "name": "字段名",
-                        "value": "要写入模板的内容",
+                        "value": "瑕佸啓鍏ユā鏉跨殑鍐呭",
                         "confidence": 0.0,
                         "reason": "简短依据",
                     }
@@ -4124,6 +3732,23 @@ def fill_docx_template(template_path: Path, answers: list[dict[str, Any]], outpu
     return output_path
 
 
+def fill_docx_batch(template_path: Path, records: list[dict[str, Any]]) -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    docx_paths = []
+    for index, record in enumerate(records, start=1):
+        output_path = fill_docx_template(template_path, record.get("answers", []), record.get("title", ""))
+        safe_title = safe_filename(record.get("title") or f"training-log-{index}")
+        renamed_path = OUTPUT_DIR / f"{uuid.uuid4().hex}-{safe_title}.docx"
+        output_path.replace(renamed_path)
+        docx_paths.append(renamed_path)
+
+    zip_path = OUTPUT_DIR / f"{uuid.uuid4().hex}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, path in enumerate(docx_paths, start=1):
+            archive.write(path, arcname=f"{index:02d}-{path.name.split('-', 1)[-1]}")
+    return zip_path
+
+
 def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], output_format: str, package_mode: str) -> Path:
     if not records:
         raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
@@ -4189,6 +3814,34 @@ def delete_output_child_if_safe(path: Path) -> None:
     if root not in target.parents or not target.is_file():
         return
     target.unlink(missing_ok=True)
+
+
+def fill_docx_records(template_path: Path, records: list[dict[str, Any]]) -> Path:
+    if not records:
+        raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    base_doc: Any | None = None
+    for index, record in enumerate(records):
+        doc = Document(str(template_path))
+        answers = record.get("answers", [])
+        if not isinstance(answers, list):
+            answers = []
+        answer_map = build_answer_map(answers)
+        fill_document_paragraphs(doc, answer_map)
+        for table in doc.tables:
+            fill_table_with_answers(table, answer_map)
+        if base_doc is None:
+            base_doc = doc
+            continue
+        base_doc.add_page_break()
+        append_doc_body(base_doc, doc)
+
+    output_stem = output_title_for_records(records)
+    suffix = f"-{safe_filename(output_stem)}" if output_stem else ""
+    output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}{suffix}.docx"
+    assert base_doc is not None
+    base_doc.save(str(output_path))
+    return output_path
 
 
 ANSWER_ALIASES = {
@@ -4367,30 +4020,6 @@ def package_title_for_records(records: list[dict[str, Any]]) -> str:
         return f"{format_record_date(typed_dates[0])}等{len(typed_dates)}天训练日志"
     return f"{output_title_for_records(records)}训练日志"
 
-
-def friendly_folder_name(records: list[dict[str, Any]], writer: str) -> str:
-    """生成可读的文件夹名，例如 "6.1-6.9 张三" / "6.1 张三" / "6.1等26天 张三"。
-
-    - 月日用一位数表达（"6.1" 而不是 "06.01"），更符合中文习惯
-    - 填写人不为空时，跟在日期后面用一个空格隔开
-    - 返回值已经经过 safe_filename，可直接当目录名
-    """
-    dates_raw = [parse_record_date(record_date_value(r)) for r in records]
-    dates = [d for d in dates_raw if d is not None]
-    if dates:
-        first = dates[0]
-        last = dates[-1]
-        if len(dates) == 1:
-            date_part = f"{first.month}.{first.day}训练日志"
-        elif are_continuous_dates(dates):
-            date_part = f"{first.month}.{first.day}-{last.month}.{last.day}训练日志"
-        else:
-            date_part = f"{first.month}.{first.day}等{len(dates)}天训练日志"
-    else:
-        date_part = f"{output_title_for_records(records)}训练日志"
-    writer = (writer or "").strip()
-    name = f"{date_part} {writer}" if writer else date_part
-    return safe_filename(name)
 
 def record_file_title(record: dict[str, Any], index: int) -> str:
     parsed_date = parse_record_date(record_date_value(record))

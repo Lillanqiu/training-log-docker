@@ -330,6 +330,8 @@ loginForm?.addEventListener("submit", async (event) => {
     }
     showAuthenticatedApp(payload.user);
     await loadSavedConfig();
+    // 登录完成后再发一次 auth-changed，触发共享设置和共享默认值的刷新
+    window.dispatchEvent(new CustomEvent("auth-changed", { detail: { user: payload.user } }));
     loginStatus.textContent = "";
   } catch (error) {
     loginStatus.textContent = error.message;
@@ -518,7 +520,7 @@ form.addEventListener("submit", async (event) => {
   if (saveOnGenerate && window.saveCurrentApiPreset && !window.saveCurrentApiPreset()) {
     statusPill.textContent = "失败";
     results.className = "results empty";
-    results.textContent = "请先在 API 设置里点击“新建配置”，选中新建的 API 配置后再保存。";
+    results.textContent = "当前 API 配置保存失败，请检查地址、模型和预设后重试。";
     return;
   }
   results.className = "results empty";
@@ -940,11 +942,13 @@ function loadSkillsPresets() {
 function savePromptPresets() {
   const customPresets = promptPresets.filter((preset) => !preset.builtin);
   window.localStorage.setItem("promptPresets", JSON.stringify(customPresets));
+  if (typeof scheduleShareAutoSync === "function") scheduleShareAutoSync();
 }
 
 function saveSkillsPresets() {
   const customPresets = skillsPresets.filter((preset) => !preset.builtin);
   window.localStorage.setItem("skillsPresets", JSON.stringify(customPresets));
+  if (typeof scheduleShareAutoSync === "function") scheduleShareAutoSync();
 }
 
 function loadGenerationDefault() {
@@ -1580,7 +1584,6 @@ async function loadSavedConfig() {
     }
     apiModel.value = model;
     window.dispatchEvent(new CustomEvent("api-config-loaded", { detail: config }));
-    window.syncApiPresetStateAfterLoad?.(config);
     updateApiSummary();
     syncOllamaModelControls();
   } catch {
@@ -2116,6 +2119,28 @@ function renderGeneratedUserNote(payload) {
   generatedUserNote.textContent = `生成用户：${generatedUser}。本次记录已写入历史记录，可在电脑重启后继续查找下载。`;
 }
 
+// 兜底：在历史区域整体加一道 contextmenu 监听，遇到点在卡里就阻止浏览器默认菜单，
+// 找到对应卡片冒泡触发后，浏览器自带菜单就不会再跳出来了。
+(function attachHistoryPanelContextmenu() {
+  const panel = document.querySelector(".history-panel");
+  if (!panel) return;
+  panel.addEventListener("contextmenu", (event) => {
+    const card = event.target.closest && event.target.closest(".history-item");
+    if (card) {
+      event.preventDefault();
+    }
+  });
+  const resume = document.querySelector("#resume-panel");
+  if (resume) {
+    resume.addEventListener("contextmenu", (event) => {
+      const card = event.target.closest && event.target.closest(".resume-job-item");
+      if (card) {
+        event.preventDefault();
+      }
+    });
+  }
+})();
+
 async function loadGenerationHistory() {
   if (!historyList || !historyStatus) return;
   const writer = historyWriterFilter?.value?.trim() || "";
@@ -2218,7 +2243,47 @@ function createResumeJobNode(item) {
   }
 
   card.append(top, meta, message, actions);
+
+  // 右键菜单：从列表里删除这条未完成批量任务。
+  card.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    const statusLabel = resumeStatusLabel(item.status);
+    openContextMenu(event.clientX, event.clientY, [
+      {
+        label: "删除这个批量任务",
+        danger: true,
+        onClick: async () => {
+          if (!window.confirm(`确定删除「${item.title || "未完成批量任务"}」吗？\n当前状态：${statusLabel}。\n（只是从列表里去掉，已经生成的文件夹仍会保留，可在下载里找到）`)) {
+            return;
+          }
+          await deleteResumeJob(String(item.id || ""), card);
+        },
+      },
+      { label: "取消" },
+    ]);
+  });
+
   return card;
+}
+
+async function deleteResumeJob(jobId, card) {
+  if (!jobId) return;
+  if (card) card.style.opacity = "0.5";
+  try {
+    const response = await fetch(`/api/resume-jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "删除失败");
+    }
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    loadResumeJobs();
+  } catch (error) {
+    if (card) card.style.opacity = "";
+    if (resumeStatus) {
+      resumeStatus.className = "error-text";
+      resumeStatus.textContent = humanFetchError(error);
+    }
+  }
 }
 
 function resumeStatusLabel(status) {
@@ -2287,21 +2352,43 @@ function createHistoryItemNode(item) {
   const card = document.createElement("article");
   card.className = "history-item";
   if (!item.available) card.classList.add("missing");
+  card.dataset.historyId = String(item.id || "");
+  const recoveredFlag = Boolean(item.recovered) || String(item.id || "").startsWith("discovered-");
+  if (recoveredFlag) card.dataset.recovered = "1";
 
   const top = document.createElement("div");
   top.className = "history-item-top";
   const title = document.createElement("strong");
   title.textContent = item.title || "训练日志";
+  // 填写人徽标：让“是谁生成的”一眼看到，免去翻 meta 行。
+  const writerName = (item.generated_user || "").trim();
+  if (writerName && writerName !== "未填写") {
+    const writerBadge = document.createElement("span");
+    writerBadge.className = "history-writer-badge";
+    writerBadge.textContent = `填写人：${writerName}`;
+    writerBadge.title = `这条记录的填写人是 ${writerName}`;
+    top.append(title, writerBadge);
+  } else {
+    top.append(title);
+  }
   const time = document.createElement("span");
+  time.className = "history-time";
   time.textContent = formatHistoryTime(item.created_at);
-  top.append(title, time);
+  top.append(time);
 
   const meta = document.createElement("div");
   meta.className = "history-meta";
   const stats = item.stats || {};
-  const recovered = Boolean(item.recovered) || String(item.id || "").startsWith("discovered-");
-  const tokenText = Number(stats.total_tokens || 0) ? `Token ${stats.total_tokens}` : "Token 未统计";
-  const durationText = Number(stats.duration_seconds || 0) ? `耗时 ${Number(stats.duration_seconds).toFixed(1)} 秒` : "耗时未统计";
+  const recovered = recoveredFlag;
+  // 速率仍以输出 token 为口径（输入是 prompt 解码，速度本来就远高于生成）。
+  const durationSec = Number(stats.duration_seconds || 0);
+  const outputTok = Number(stats.output_tokens || 0);
+  const totalTok = Number(stats.total_tokens || 0);
+  const speedTok = outputTok > 0 ? outputTok : totalTok;
+  const tps = (durationSec > 0 && speedTok > 0) ? (speedTok / durationSec).toFixed(1) : "";
+  const tokenText = totalTok ? `Token ${totalTok}` : "Token 未统计";
+  const durationText = durationSec ? `耗时 ${durationSec.toFixed(1)} 秒` : "耗时未统计";
+  const speedText = tps ? `速率 ${tps} token/s` : "";
   meta.textContent = [
     `生成用户：${item.generated_user || "未填写"}`,
     `篇数：${item.record_count || 1}`,
@@ -2309,6 +2396,7 @@ function createHistoryItemNode(item) {
     `来源：${item.source_label || "本机"}`,
     recovered ? "找回文件：仅可下载，不含历史耗时和 Token" : durationText,
     recovered ? "" : tokenText,
+    recovered ? "" : speedText,
   ].filter(Boolean).join(" / ");
 
   const titles = document.createElement("div");
@@ -2352,7 +2440,177 @@ function createHistoryItemNode(item) {
   card.append(top, meta);
   if (titles.textContent) card.append(titles);
   card.append(actions);
+
+  // 右键菜单：
+  //  - 不在选择模式：单删 + 进入选择并标记这张
+  //  - 在选择模式：切换这张的选中态 + 批量删除选中的
+  card.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    const itemId = String(item.id || "");
+    const recovered = Boolean(item.recovered) || itemId.startsWith("discovered-");
+    const writer = (item.generated_user || "").trim();
+    const tip = writer ? `（填写人：${writer}）` : "";
+    const singleDelete = {
+      label: recovered ? "从磁盘删除整个文件夹" : "删除这条历史",
+      danger: true,
+      onClick: async () => {
+        if (recovered) {
+          const title = item.title || "找回项";
+          if (!window.confirm(`这会从 outputs/ 里永久删除「${title}」整个文件夹/文件，不可恢复。\n继续？`)) return;
+          if (!window.confirm("再确认一次：真的从磁盘删掉吗？")) return;
+          await deleteRecoveredEntry(itemId, card);
+        } else {
+          if (!window.confirm(`确定删除这条历史记录${tip}吗？\n（只是从列表里去掉，不会删除已生成的文档文件）`)) return;
+          await deleteHistoryEntry(itemId, card);
+        }
+      },
+    };
+
+    if (typeof historySelectMode !== "undefined" && historySelectMode) {
+      // 选择模式：切换这张 + 批量删除选中的 + 退出
+      const isSelected = historySelectedIds.has(itemId);
+      openContextMenu(event.clientX, event.clientY, [
+        {
+          label: isSelected ? "取消选择这条" : "加入选择",
+          onClick: () => {
+            if (isSelected) historySelectedIds.delete(itemId);
+            else historySelectedIds.add(itemId);
+            refreshHistorySelectionVisuals();
+          },
+        },
+        {
+          label: `删除选中的 ${historySelectedIds.size} 条`,
+          danger: true,
+          disabled: historySelectedIds.size === 0,
+          onClick: () => historyBatchDelete?.click(),
+        },
+        {
+          label: "退出选择模式",
+          onClick: () => setHistorySelectMode(false),
+        },
+        { label: "取消" },
+      ]);
+    } else {
+      // 普通模式：单删 + 进入选择（顺手选中这张）
+      openContextMenu(event.clientX, event.clientY, [
+        singleDelete,
+        {
+          label: "进入选择模式（顺便选中这条）",
+          onClick: () => {
+            setHistorySelectMode(true);
+            historySelectedIds.add(itemId);
+            refreshHistorySelectionVisuals();
+          },
+        },
+        { label: "取消" },
+      ]);
+    }
+  });
+
   return card;
+}
+
+// 通用右键菜单：历史记录 / 未完成批量任务 共用一套。
+let activeContextMenu = null;
+
+function closeContextMenu() {
+  if (activeContextMenu && activeContextMenu.parentNode) {
+    activeContextMenu.parentNode.removeChild(activeContextMenu);
+  }
+  activeContextMenu = null;
+  document.removeEventListener("click", handleContextMenuClickOutside, true);
+  document.removeEventListener("contextmenu", handleContextMenuOutside, true);
+  window.removeEventListener("blur", closeContextMenu);
+  window.removeEventListener("resize", closeContextMenu);
+}
+
+// 只在点击落在菜单*外部*时才关闭。点击菜单内部按钮要让按钮自己的 click 处理跑完。
+function handleContextMenuClickOutside(event) {
+  if (activeContextMenu && !activeContextMenu.contains(event.target)) {
+    closeContextMenu();
+  }
+}
+
+function handleContextMenuOutside(event) {
+  if (activeContextMenu && !activeContextMenu.contains(event.target)) {
+    closeContextMenu();
+  }
+}
+
+function openContextMenu(clientX, clientY, items) {
+  closeContextMenu();
+  const menu = document.createElement("div");
+  menu.className = "history-context-menu";
+  menu.setAttribute("role", "menu");
+
+  items.forEach((entry) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "history-context-menu-item" + (entry.danger ? " danger" : "");
+    btn.textContent = entry.label;
+    btn.disabled = !!entry.disabled;
+    btn.addEventListener("click", async () => {
+      closeContextMenu();
+      if (entry.onClick && !entry.disabled) {
+        try { await entry.onClick(); } catch (e) { console.error(e); }
+      }
+    });
+    menu.append(btn);
+  });
+
+  menu.style.visibility = "hidden";
+  document.body.append(menu);
+  const rect = menu.getBoundingClientRect();
+  const x = Math.min(clientX, window.innerWidth - rect.width - 8);
+  const y = Math.min(clientY, window.innerHeight - rect.height - 8);
+  menu.style.left = `${Math.max(8, x)}px`;
+  menu.style.top = `${Math.max(8, y)}px`;
+  menu.style.visibility = "visible";
+
+  activeContextMenu = menu;
+  document.addEventListener("click", handleContextMenuClickOutside, true);
+  document.addEventListener("contextmenu", handleContextMenuOutside, true);
+  window.addEventListener("blur", closeContextMenu);
+  window.addEventListener("resize", closeContextMenu);
+}
+
+async function deleteRecoveredEntry(recoveredId, card) {
+  if (!recoveredId) return;
+  if (card) card.style.opacity = "0.5";
+  try {
+    const response = await fetch(`/api/recovered/${encodeURIComponent(recoveredId)}`, { method: "DELETE" });
+    const payload = await readResponse(response);
+    if (!response.ok) throw new Error(payload.detail || "删除失败");
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    loadGenerationHistory();
+  } catch (error) {
+    if (card) card.style.opacity = "";
+    if (historyStatus) {
+      historyStatus.className = "error-text";
+      historyStatus.textContent = humanFetchError(error);
+    }
+  }
+}
+
+async function deleteHistoryEntry(historyId, card) {
+  if (!historyId) return;
+  if (card) card.style.opacity = "0.5";
+  try {
+    const response = await fetch(`/api/history/${encodeURIComponent(historyId)}`, { method: "DELETE" });
+    const payload = await readResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.detail || "删除失败");
+    }
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    // 删完刷新一下状态行的“已读取 X 条”计数
+    loadGenerationHistory();
+  } catch (error) {
+    if (card) card.style.opacity = "";
+    if (historyStatus) {
+      historyStatus.className = "error-text";
+      historyStatus.textContent = humanFetchError(error);
+    }
+  }
 }
 
 function createHistoryFilesDetails(downloads) {
@@ -2497,7 +2755,6 @@ function createPreviewCard(record, index) {
   card.append(table);
   return card;
 }
-
 function createGenerationStatsNode(stats) {
   if (!stats || typeof stats !== "object") return null;
   const row = document.createElement("div");
@@ -2513,9 +2770,14 @@ function createGenerationStatsNode(stats) {
   const input = Number(stats.input_tokens || 0);
   const output = Number(stats.output_tokens || 0);
   const duration = Number(stats.duration_seconds || 0);
+  // 速率口径：只统计模型实际生成（输出）token / 耗时。
+  // 输入 token 是 prompt 解码，速度天然远高于生成，混在分子里会把数值算得偏高。
+  const speedTokens = output > 0 ? output : total;
+  const tps = (duration > 0 && speedTokens > 0) ? (speedTokens / duration).toFixed(1) : null;
   row.replaceChildren(
     statPill("耗时", duration ? `${duration.toFixed(duration >= 10 ? 1 : 2)} 秒` : "0 秒"),
     statPill("Token", total ? `${total}（入 ${input} / 出 ${output}）` : "未统计"),
+    ...(tps ? [statPill("生成速率", `${tps} token/s`)] : []),
     statPill("来源", sourceLabel),
     statPill("模型", stats.model || "未知模型")
   );
@@ -2532,7 +2794,6 @@ function statPill(label, value) {
   item.append(name, text);
   return item;
 }
-
 function previewRow(items) {
   const row = document.createElement("tr");
   items.forEach(([label, value]) => {
@@ -2568,4 +2829,470 @@ function compactRepeatedPlan(value) {
     unique.push(cleaned);
   });
   return unique.map((line, index) => `${index + 1}. ${line}`).join("\n");
+}
+
+// ============== 共享设置（左上角齿轮） ==============
+// host 账号能编辑共享内容；其他人进来时自动拉一份预填到表单里。
+
+const shareSettingsToggle = document.querySelector("#share-settings-toggle");
+const shareSettingsPanel = document.querySelector("#share-settings-panel");
+const shareSettingsCloseBtn = document.querySelector("#share-settings-close");
+const shareSettingsSaveBtn = document.querySelector("#share-settings-save");
+const shareSettingsStatusEl = document.querySelector("#share-settings-status");
+const shareApiToggleEl = document.querySelector("#share-api-toggle");
+const sharePromptToggleEl = document.querySelector("#share-prompt-toggle");
+const shareSkillsToggleEl = document.querySelector("#share-skills-toggle");
+const sharedPromptTextarea = document.querySelector("#shared-prompt-text");
+const sharedSkillsTextarea = document.querySelector("#shared-skills-text");
+
+async function refreshShareSettingsUI() {
+  if (!shareSettingsToggle) return null;
+  try {
+    const response = await fetch("/api/share-settings");
+    if (!response.ok) return null;
+    const data = await response.json();
+    shareSettingsToggle.classList.toggle("hidden", !data.is_host);
+    if (data.is_host) {
+      if (shareApiToggleEl) shareApiToggleEl.checked = !!data.share_api;
+      if (sharePromptToggleEl) sharePromptToggleEl.checked = !!data.share_prompt;
+      if (shareSkillsToggleEl) shareSkillsToggleEl.checked = !!data.share_skills;
+      if (sharedPromptTextarea) sharedPromptTextarea.value = data.shared_prompt || "";
+      if (sharedSkillsTextarea) sharedSkillsTextarea.value = data.shared_skills || "";
+      updateCurrentShareSummary(data);
+    }
+    return data;
+  } catch (e) {
+    console.error("share-settings load failed", e);
+    return null;
+  }
+}
+
+function updateCurrentShareSummary(data) {
+  const el = document.querySelector("#current-share-summary");
+  if (!el) return;
+  const prompt = String(data.shared_prompt || "").trim();
+  const skills = String(data.shared_skills || "").trim();
+  const skillsLines = skills ? skills.split(/\r?\n/).filter(Boolean).length : 0;
+  const promptInfo = prompt
+    ? `📝 提示词：${prompt.length} 字 — "${prompt.slice(0, 40).replace(/\n/g, " ")}${prompt.length > 40 ? "..." : ""}"`
+    : "📝 提示词：（空，主表单里没填内容；非 host 的人看不到任何提示词）";
+  const skillsInfo = skills
+    ? `🎯 Skills：${skillsLines} 行 — "${skills.slice(0, 40).replace(/\n/g, " · ")}${skills.length > 40 ? "..." : ""}"`
+    : "🎯 Skills：（空，主表单里没填内容；非 host 的人看不到任何 skills）";
+  el.innerHTML = `<div class="share-current-line">${promptInfo}</div><div class="share-current-line">${skillsInfo}</div>`;
+}
+
+if (shareSettingsToggle && shareSettingsPanel) {
+  shareSettingsToggle.addEventListener("click", () => {
+    shareSettingsPanel.classList.remove("hidden");
+    if (shareSettingsStatusEl) shareSettingsStatusEl.textContent = "";
+  });
+}
+if (shareSettingsCloseBtn && shareSettingsPanel) {
+  shareSettingsCloseBtn.addEventListener("click", () => {
+    shareSettingsPanel.classList.add("hidden");
+  });
+}
+if (shareSettingsPanel) {
+  // 点遮罩关闭
+  shareSettingsPanel.addEventListener("click", (event) => {
+    if (event.target === shareSettingsPanel) shareSettingsPanel.classList.add("hidden");
+  });
+}
+
+
+if (shareSettingsSaveBtn) {
+  shareSettingsSaveBtn.addEventListener("click", async () => {
+    if (shareSettingsStatusEl) {
+      shareSettingsStatusEl.style.color = "";
+      shareSettingsStatusEl.textContent = "保存中...";
+    }
+    try {
+      // 提示词/skills：如果"强推"文本框留空，自动用当前主表单里的值来共享。
+      const formPrompt = (document.querySelector("#custom-prompt")?.value || "").trim();
+      const formSkills = (document.querySelector("#custom-skills")?.value || "").trim();
+      const overridePrompt = (sharedPromptTextarea?.value || "").trim();
+      const overrideSkills = (sharedSkillsTextarea?.value || "").trim();
+      const sharedPrompt = overridePrompt || formPrompt;
+      const sharedSkills = overrideSkills || formSkills;
+
+      const response = await fetch("/api/share-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          share_api: !!shareApiToggleEl?.checked,
+          share_prompt: !!sharePromptToggleEl?.checked,
+          share_skills: !!shareSkillsToggleEl?.checked,
+          shared_prompt: sharedPrompt,
+          shared_skills: sharedSkills,
+        }),
+      });
+      const payload = await readResponse(response);
+      if (!response.ok) throw new Error(payload.detail || "保存失败");
+
+      // 并行设置存本地 + 同步到主表单
+      const parallelEnabled = !!document.querySelector("#settings-parallel-enabled")?.checked;
+      const parallelCount = parseInt(document.querySelector("#settings-parallel-count")?.value || "2", 10);
+      try {
+        localStorage.setItem("parallel_enabled", parallelEnabled ? "1" : "0");
+        localStorage.setItem("parallel_count", String(parallelCount));
+      } catch (_) {}
+      syncParallelToMainForm();
+
+      if (shareSettingsStatusEl) shareSettingsStatusEl.textContent = "已保存。";
+    } catch (e) {
+      if (shareSettingsStatusEl) {
+        shareSettingsStatusEl.textContent = humanFetchError(e);
+        shareSettingsStatusEl.style.color = "#b3261e";
+      }
+    }
+  });
+}
+
+// 设置面板里的"并行" → 主表单的 #parallel-count 同步
+function syncParallelToMainForm() {
+  const enabled = document.querySelector("#settings-parallel-enabled")?.checked !== false;
+  const count = parseInt(document.querySelector("#settings-parallel-count")?.value || "2", 10);
+  const mainSelect = document.querySelector("#parallel-count");
+  if (mainSelect) mainSelect.value = String(enabled ? Math.max(1, Math.min(4, count)) : 1);
+}
+
+// 设置面板首次打开时，把存的偏好读回来；如果没存过，默认开 + 2
+(function initParallelFromLocal() {
+  try {
+    const sw = document.querySelector("#settings-parallel-enabled");
+    const cnt = document.querySelector("#settings-parallel-count");
+    if (sw) sw.checked = localStorage.getItem("parallel_enabled") !== "0";
+    if (cnt) cnt.value = localStorage.getItem("parallel_count") || "2";
+  } catch (_) {}
+  // 改完立即同步，不用等保存
+  document.querySelector("#settings-parallel-enabled")?.addEventListener("change", () => {
+    try { localStorage.setItem("parallel_enabled", document.querySelector("#settings-parallel-enabled").checked ? "1" : "0"); } catch (_) {}
+    syncParallelToMainForm();
+  });
+  document.querySelector("#settings-parallel-count")?.addEventListener("change", () => {
+    try { localStorage.setItem("parallel_count", document.querySelector("#settings-parallel-count").value); } catch (_) {}
+    syncParallelToMainForm();
+  });
+  syncParallelToMainForm();
+})();
+
+// 非 host 进页面时拉 host 共享的默认值，预填到表单（只填空字段，避免冲掉自己的修改）
+async function loadSharedDefaults() {
+  try {
+    const response = await fetch("/api/shared-defaults");
+    if (!response.ok) return;
+    const bundle = await response.json();
+    if (bundle.is_host) return;
+    const fields = bundle.shared_fields || [];
+    let appliedSomething = false;
+    if (fields.includes("custom_prompt")) {
+      const el = document.querySelector("#custom-prompt");
+      if (el && bundle.custom_prompt) { el.value = bundle.custom_prompt; appliedSomething = true; }
+    }
+    if (fields.includes("custom_skills")) {
+      const el = document.querySelector("#custom-skills");
+      if (el && bundle.custom_skills) { el.value = bundle.custom_skills; appliedSomething = true; }
+    }
+    // 把 host 的自定义预设 merge 进本地下拉。带 (host 共享) 后缀，避免和本地同名混淆。
+    if (Array.isArray(bundle.shared_prompt_presets) && bundle.shared_prompt_presets.length && typeof promptPresets !== "undefined") {
+      const existingNames = new Set(promptPresets.map((x) => x.name));
+      bundle.shared_prompt_presets.forEach((p) => {
+        const label = `${p.name}（host 共享）`;
+        if (existingNames.has(label)) return;
+        promptPresets.push({ name: label, prompt: p.prompt || "", builtin: false, fromHost: true });
+        existingNames.add(label);
+      });
+      if (typeof renderPromptPresets === "function") renderPromptPresets();
+      appliedSomething = true;
+    }
+    if (Array.isArray(bundle.shared_skills_presets) && bundle.shared_skills_presets.length && typeof skillsPresets !== "undefined") {
+      const existingNames = new Set(skillsPresets.map((x) => x.name));
+      bundle.shared_skills_presets.forEach((p) => {
+        const label = `${p.name}（host 共享）`;
+        if (existingNames.has(label)) return;
+        skillsPresets.push({ name: label, skills: p.skills || "", builtin: false, fromHost: true });
+        existingNames.add(label);
+      });
+      if (typeof renderSkillsPresets === "function") renderSkillsPresets();
+      appliedSomething = true;
+    }
+    if (appliedSomething) showSharedFromHostBadge();
+    if (fields.includes("api_config") && bundle.api_config) {
+      const keyEl = document.querySelector("#api-key");
+      if (keyEl && !keyEl.value.trim()) {
+        const formatEl = document.querySelector("#api-format");
+        const baseEl = document.querySelector("#api-base-url");
+        const modelEl = document.querySelector("#api-model");
+        if (formatEl) formatEl.value = bundle.api_config.format || formatEl.value;
+        if (baseEl) baseEl.value = bundle.api_config.base_url || baseEl.value;
+        keyEl.value = bundle.api_config.api_key || "";
+        if (modelEl) {
+          const m = bundle.api_config.model || "";
+          if (m && ![...modelEl.options].some((o) => o.value === m)) {
+            modelEl.append(new Option(m, m));
+          }
+          if (m) modelEl.value = m;
+        }
+        if (typeof updateApiSummary === "function") updateApiSummary();
+      }
+    }
+  } catch (e) {
+    console.warn("shared-defaults load failed", e);
+  }
+}
+
+function showSharedFromHostBadge() {
+  if (document.querySelector("#shared-from-host-badge")) return;
+  const target = document.querySelector("#auto-fill-panel") || document.querySelector("#fill-form");
+  if (!target) return;
+  const badge = document.createElement("div");
+  badge.id = "shared-from-host-badge";
+  badge.textContent = "✓ 提示词 / Skills 已从 host 自动加载";
+  badge.style.cssText = "padding:8px 12px; margin:8px 0; border-radius:6px; background:rgba(15,143,105,0.10); color:#0c8f68; font-size:13px; font-weight:700;";
+  target.prepend(badge);
+}
+
+refreshShareSettingsUI();
+loadSharedDefaults();
+window.addEventListener("auth-changed", () => {
+  refreshShareSettingsUI();
+  loadSharedDefaults();
+});
+
+// host 模式下，主表单的 提示词 / Skills 改完自动推送到 share-settings，
+// 这样其他人下次刷新就能看到最新内容，无需 host 手动到"设置"里点保存。
+let _isHostCached = false;
+let _shareAutoSyncTimer = null;
+
+async function shareAutoSyncFromForm() {
+  if (!_isHostCached) return;
+  try {
+    const sharePromptEl = document.querySelector("#share-prompt-toggle");
+    const shareSkillsEl = document.querySelector("#share-skills-toggle");
+    const shareApiEl = document.querySelector("#share-api-toggle");
+    const formPrompt = (document.querySelector("#custom-prompt")?.value || "").trim();
+    const formSkills = (document.querySelector("#custom-skills")?.value || "").trim();
+    const overridePrompt = (sharedPromptTextarea?.value || "").trim();
+    const overrideSkills = (sharedSkillsTextarea?.value || "").trim();
+    // 整组自定义预设（非内置）也一起共享出去
+    const sharedPromptPresets = (typeof promptPresets !== "undefined" && Array.isArray(promptPresets))
+      ? promptPresets.filter((x) => !x.builtin).map((x) => ({ name: x.name, prompt: x.prompt }))
+      : [];
+    const sharedSkillsPresets = (typeof skillsPresets !== "undefined" && Array.isArray(skillsPresets))
+      ? skillsPresets.filter((x) => !x.builtin).map((x) => ({ name: x.name, skills: x.skills }))
+      : [];
+    await fetch("/api/share-settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        share_api: shareApiEl ? !!shareApiEl.checked : true,
+        share_prompt: sharePromptEl ? !!sharePromptEl.checked : true,
+        share_skills: shareSkillsEl ? !!shareSkillsEl.checked : true,
+        shared_prompt: overridePrompt || formPrompt,
+        shared_skills: overrideSkills || formSkills,
+        shared_prompt_presets: sharedPromptPresets,
+        shared_skills_presets: sharedSkillsPresets,
+      }),
+    });
+    refreshShareSettingsUI();
+  } catch (e) {
+    console.warn("share auto-sync failed", e);
+  }
+}
+
+function scheduleShareAutoSync() {
+  if (_shareAutoSyncTimer) clearTimeout(_shareAutoSyncTimer);
+  _shareAutoSyncTimer = setTimeout(() => { shareAutoSyncFromForm(); }, 700);
+}
+
+// 拿到 is_host 之后，给主表单的提示词/skills textarea 挂监听
+(async function setupShareAutoSync() {
+  try {
+    const r = await fetch("/api/share-settings");
+    if (!r.ok) return;
+    const data = await r.json();
+    _isHostCached = !!data.is_host;
+    if (!_isHostCached) return;
+    document.querySelector("#custom-prompt")?.addEventListener("input", scheduleShareAutoSync);
+    document.querySelector("#custom-skills")?.addEventListener("input", scheduleShareAutoSync);
+    // 选了预设 / 切换 prompt skills 模式之类也会改 textarea 的 value，监听 change 兜底
+    document.querySelector("#custom-prompt")?.addEventListener("change", scheduleShareAutoSync);
+    document.querySelector("#custom-skills")?.addEventListener("change", scheduleShareAutoSync);
+    // 顺手保证最初一次也推一下（用户第一次进来选了默认预设，也立刻同步）
+    setTimeout(scheduleShareAutoSync, 1500);
+  } catch (_) { /* ignore */ }
+})();
+
+// ============== 历史记录批量删除 ==============
+const historyBatchToolbar = document.querySelector("#history-batch-toolbar");
+const historyBatchCount = document.querySelector("#history-batch-count");
+const historyBatchAll = document.querySelector("#history-batch-all");
+const historyBatchClear = document.querySelector("#history-batch-clear");
+const historyBatchDelete = document.querySelector("#history-batch-delete");
+const historyBatchCancel = document.querySelector("#history-batch-cancel");
+const historySelectToggle = document.querySelector("#history-select-toggle");
+
+let historySelectMode = false;
+const historySelectedIds = new Set();
+
+function setHistorySelectMode(on) {
+  historySelectMode = !!on;
+  if (historyBatchToolbar) historyBatchToolbar.classList.toggle("hidden", !historySelectMode);
+  if (historySelectToggle) historySelectToggle.textContent = historySelectMode ? "退出选择" : "选择";
+  if (!historySelectMode) historySelectedIds.clear();
+  refreshHistorySelectionVisuals();
+}
+
+function toggleHistoryCardSelection(card, id) {
+  if (!id) return;
+  if (historySelectedIds.has(id)) historySelectedIds.delete(id);
+  else historySelectedIds.add(id);
+  card.classList.toggle("selected", historySelectedIds.has(id));
+  const cb = card.querySelector(".history-item-check");
+  if (cb) cb.checked = historySelectedIds.has(id);
+  updateHistoryBatchCount();
+}
+
+function handleHistoryCardClickInSelectMode(event) {
+  if (!historySelectMode) return;
+  // 点到下载链接 / 按钮 / 复选框 / 输入框 上时，不切换选择，让它们做自己该做的事
+  if (event.target.closest("a, button, input, label, summary")) return;
+  const card = event.currentTarget;
+  toggleHistoryCardSelection(card, card.dataset.historyId || "");
+}
+
+function refreshHistorySelectionVisuals() {
+  const cards = historyList ? historyList.querySelectorAll(".history-item") : [];
+  cards.forEach((card) => {
+    const id = card.dataset.historyId || "";
+    card.classList.toggle("selectable", historySelectMode);
+    card.classList.toggle("selected", historySelectMode && historySelectedIds.has(id));
+
+    // 让卡片本体可点：选择模式下，点空白区域也能切换选择
+    if (historySelectMode) {
+      if (!card._historySelectListener) {
+        card.addEventListener("click", handleHistoryCardClickInSelectMode);
+        card._historySelectListener = true;
+      }
+    } else if (card._historySelectListener) {
+      card.removeEventListener("click", handleHistoryCardClickInSelectMode);
+      card._historySelectListener = false;
+    }
+
+    let cb = card.querySelector(".history-item-check");
+    if (historySelectMode) {
+      if (!cb) {
+        cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "history-item-check";
+        cb.addEventListener("click", (event) => event.stopPropagation());
+        cb.addEventListener("change", (event) => {
+          if (event.target.checked) historySelectedIds.add(id);
+          else historySelectedIds.delete(id);
+          card.classList.toggle("selected", event.target.checked);
+          updateHistoryBatchCount();
+        });
+        card.prepend(cb);
+      }
+      cb.checked = historySelectedIds.has(id);
+    } else if (cb) {
+      cb.remove();
+    }
+  });
+  updateHistoryBatchCount();
+}
+
+function updateHistoryBatchCount() {
+  if (historyBatchCount) historyBatchCount.textContent = `已选 ${historySelectedIds.size} 条`;
+  if (historyBatchDelete) historyBatchDelete.disabled = historySelectedIds.size === 0;
+}
+
+if (historySelectToggle) {
+  historySelectToggle.addEventListener("click", () => setHistorySelectMode(!historySelectMode));
+}
+if (historyBatchCancel) {
+  historyBatchCancel.addEventListener("click", () => setHistorySelectMode(false));
+}
+if (historyBatchAll) {
+  historyBatchAll.addEventListener("click", () => {
+    const cards = historyList ? historyList.querySelectorAll(".history-item") : [];
+    cards.forEach((card) => {
+      const id = card.dataset.historyId || "";
+      if (id) historySelectedIds.add(id);
+    });
+    refreshHistorySelectionVisuals();
+  });
+}
+if (historyBatchClear) {
+  historyBatchClear.addEventListener("click", () => {
+    historySelectedIds.clear();
+    refreshHistorySelectionVisuals();
+  });
+}
+if (historyBatchDelete) {
+  historyBatchDelete.addEventListener("click", async () => {
+    if (historySelectedIds.size === 0) return;
+    const ids = Array.from(historySelectedIds);
+    const recoveredCount = ids.filter((id) => id.startsWith("discovered-")).length;
+    const regularCount = ids.length - recoveredCount;
+    let message = `确定要批量删除选中的 ${ids.length} 条记录吗？\n  · 普通历史：${regularCount} 条（只从列表删除，不动文件）`;
+    if (recoveredCount > 0) {
+      message += `\n  · 找回项：${recoveredCount} 条（会**永久删除磁盘上的文件夹**，不可恢复）`;
+    }
+    if (!window.confirm(message)) return;
+    if (recoveredCount > 0 && !window.confirm(`再确认一次：${recoveredCount} 条找回项会从磁盘上彻底删除。继续？`)) {
+      return;
+    }
+    historyBatchDelete.disabled = true;
+    historyBatchDelete.textContent = "删除中...";
+    console.log("[batch delete] sending ids:", ids);
+    try {
+      const response = await fetch("/api/history/delete-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      const payload = await readResponse(response);
+      console.log("[batch delete] server response:", payload);
+      if (!response.ok) throw new Error(payload.detail || "批量删除失败");
+      const deleted = Number(payload.deleted || 0);
+      const total = Number(payload.total || ids.length);
+      const failed = total - deleted;
+      // 失败的项目摘出来给用户看
+      const failedItems = Array.isArray(payload.results)
+        ? payload.results.filter((r) => !r.ok)
+        : [];
+      setHistorySelectMode(false);
+      loadGenerationHistory();
+      if (historyStatus) {
+        if (failed === 0) {
+          historyStatus.className = "";
+          historyStatus.textContent = `批量删除完成：${deleted}/${total} 条全部删除成功。`;
+        } else {
+          historyStatus.className = "error-text";
+          const reasons = [...new Set(failedItems.map((r) => r.reason || "unknown"))].slice(0, 3).join(" / ");
+          historyStatus.textContent = `批量删除部分失败：成功 ${deleted}/${total}，${failed} 条没删掉（原因：${reasons || "未知"}）。详见浏览器 Console。`;
+          console.warn("[batch delete] failed items:", failedItems);
+        }
+      }
+    } catch (error) {
+      if (historyStatus) {
+        historyStatus.className = "error-text";
+        historyStatus.textContent = humanFetchError(error);
+      }
+    } finally {
+      historyBatchDelete.disabled = false;
+      historyBatchDelete.textContent = "删除选中";
+    }
+  });
+}
+
+// 历史卡片重新渲染后，如果还在选择模式，重建复选框
+const _origRenderGenHistory = typeof renderGenerationHistory === "function" ? renderGenerationHistory : null;
+if (_origRenderGenHistory) {
+  const observer = new MutationObserver(() => {
+    if (historySelectMode) refreshHistorySelectionVisuals();
+  });
+  if (historyList) observer.observe(historyList, { childList: true });
 }

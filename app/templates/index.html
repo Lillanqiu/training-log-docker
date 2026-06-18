@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI 训练日志填写</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260612-2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260616-19" />
   </head>
   <body>
     <section id="login-screen" class="login-screen">
@@ -29,17 +29,96 @@
 
     <main id="app-shell" class="shell hidden">
       <section class="hero">
-        <div class="hero-mark" aria-hidden="true">
-          <span class="doc-icon"></span>
+        <div class="hero-main">
+          <div class="hero-mark" aria-hidden="true">
+            <span class="doc-icon"></span>
+          </div>
+          <div class="hero-copy">
+            <p class="eyebrow">Docker AI Training Log Filler</p>
+            <h1>上传训练日志模板，自动生成并写入内容</h1>
+            <p class="subtle">支持保存 API 配置、读取每月训练要求网址，并把 AI 生成内容写回 DOCX 模板。</p>
+          </div>
         </div>
-        <div>
-          <p class="eyebrow">Docker AI Training Log Filler</p>
-          <h1>上传训练日志模板，自动生成并写入内容</h1>
-          <p class="subtle">支持保存 API 配置、读取每月训练要求网址，并把 AI 生成内容写回 DOCX 模板。</p>
+        <div class="hero-tools">
+          <button id="share-settings-toggle" type="button" class="share-settings-toggle hidden" title="设置">⚙</button>
+          <div class="user-chip">
+            <span id="current-user-name">未登录</span>
+            <button id="logout-button" type="button" class="secondary mini">退出</button>
+          </div>
         </div>
-        <div class="user-chip">
-          <span id="current-user-name">未登录</span>
-          <button id="logout-button" type="button" class="secondary mini">退出</button>
+      </section>
+
+      <!-- 设置弹层（仅 host 可见 / 可改） -->
+      <section id="share-settings-panel" class="share-settings-panel hidden" aria-label="设置">
+        <div class="share-settings-card">
+          <div class="settings-head">
+            <div>
+              <h2>设置</h2>
+              <p>控制本机的并行生成，以及局域网里其他人进来时能自动拿到你哪些已经设好的内容。</p>
+            </div>
+            <button id="share-settings-close" class="secondary mini" type="button" aria-label="关闭">×</button>
+          </div>
+
+          <!-- 共享设置区 -->
+          <h3 class="settings-section-title">共享给其他人</h3>
+          <div class="share-toggles">
+            <label class="checkline">
+              <input id="share-api-toggle" type="checkbox" checked />
+              <span>共享 API 配置（兼容格式 / 地址 / 模型 / Key）</span>
+            </label>
+            <label class="checkline">
+              <input id="share-prompt-toggle" type="checkbox" checked />
+              <span>共享提示词（自动用你当前表单里的"提示词"）</span>
+            </label>
+            <label class="checkline">
+              <input id="share-skills-toggle" type="checkbox" checked />
+              <span>共享 skills（自动用你当前表单里的"Skills"）</span>
+            </label>
+          </div>
+          <p class="subtle share-settings-tip">默认共享的是你当前表单里的提示词和 skills。要想强推一段固定内容，点开下面的"高级"。</p>
+
+          <div id="current-share-summary" class="share-current-summary">
+            <div class="share-current-line">📝 提示词：（加载中...）</div>
+            <div class="share-current-line">🎯 Skills：（加载中...）</div>
+          </div>
+
+          <details id="share-advanced" class="share-advanced">
+            <summary>高级（强推固定的提示词 / skills，覆盖表单当前值）</summary>
+            <div class="share-advanced-body">
+              <label class="field">
+                <span>强推的提示词（留空就用你当前表单里的）</span>
+                <textarea id="shared-prompt-text" rows="4" spellcheck="false" placeholder="只有想让别人都看到这一段、不要用你表单里的当前内容时才填。"></textarea>
+              </label>
+              <label class="field">
+                <span>强推的 skills（留空就用你当前表单里的）</span>
+                <textarea id="shared-skills-text" rows="4" spellcheck="false" placeholder="只有想让别人都看到这一段、不要用你表单里的当前内容时才填。"></textarea>
+              </label>
+            </div>
+          </details>
+
+          <!-- 并行生成区 -->
+          <h3 class="settings-section-title">本机并行生成</h3>
+          <div class="share-toggles">
+            <label class="checkline">
+              <input id="settings-parallel-enabled" type="checkbox" checked />
+              <span>启用并行生成（同一任务里同时写多篇）</span>
+            </label>
+          </div>
+          <label class="field">
+            <span>并行数量</span>
+            <select id="settings-parallel-count">
+              <option value="1">1（一篇一篇写，最稳）</option>
+              <option value="2" selected>2（推荐，速度翻倍）</option>
+              <option value="3">3（更快，更吃显存）</option>
+              <option value="4">4（最快，注意 GPU 是否扛得住）</option>
+            </select>
+          </label>
+          <p class="subtle share-settings-tip">这两项改完会同步到主表单"并行生成"那一栏，提交任务时按这里的值跑。</p>
+
+          <div class="actions">
+            <button id="share-settings-save" type="button">保存设置</button>
+            <span id="share-settings-status"></span>
+          </div>
         </div>
       </section>
 
@@ -98,12 +177,6 @@
             <button id="apply-model-group" type="button" class="secondary">确定模型组</button>
             <button id="fetch-models" type="button" class="secondary">获取模型</button>
             <span id="model-group-status"></span>
-          </div>
-
-          <div class="model-group-actions">
-            <button id="use-saved-cloud-api" type="button" class="secondary">切换应用网关</button>
-            <button id="use-local-ollama-api" type="button" class="secondary">切换本机 Ollama</button>
-            <span id="api-source-status"></span>
           </div>
 
           <label id="gpu-model-field" class="field hidden">
@@ -374,6 +447,16 @@
             </select>
           </label>
 
+          <label class="field auto-fill-panel hidden">
+            <span>并行生成（同一任务里同时写几篇）</span>
+            <select id="parallel-count" name="parallel_count">
+              <option value="1">1（一篇一篇写，最稳）</option>
+              <option value="2" selected>2（推荐，速度翻倍）</option>
+              <option value="3">3（更快，更吃显存）</option>
+              <option value="4">4（最快，注意 GPU 是否扛得住）</option>
+            </select>
+          </label>
+
           <label class="field">
             <span>训练日志模板（可不传，默认使用已内置模板）</span>
             <input id="file" name="file" type="file" accept=".pdf,.docx,.txt,.md" />
@@ -506,7 +589,19 @@
           <section class="history-panel">
             <div class="history-head">
               <h3>最近生成记录</h3>
-              <button id="history-refresh" type="button" class="secondary mini">刷新</button>
+              <div class="history-head-actions">
+                <button id="history-select-toggle" type="button" class="secondary mini">选择</button>
+                <button id="history-refresh" type="button" class="secondary mini">刷新</button>
+              </div>
+            </div>
+            <div id="history-batch-toolbar" class="history-batch-toolbar hidden">
+              <span id="history-batch-count">已选 0 条</span>
+              <div class="history-batch-actions">
+                <button id="history-batch-all" type="button" class="secondary mini">全选</button>
+                <button id="history-batch-clear" type="button" class="secondary mini">清空选择</button>
+                <button id="history-batch-delete" type="button" class="danger mini" disabled>删除选中</button>
+                <button id="history-batch-cancel" type="button" class="secondary mini">退出</button>
+              </div>
             </div>
             <div class="history-filter">
               <input id="history-writer-filter" type="text" placeholder="按填写人筛选，例如：张三" />
@@ -535,8 +630,8 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260612-2"></script>
-    <script src="/static/api-presets.js?v=20260603-12"></script>
-    <script src="/static/secret-toggle.js?v=20260528-1"></script>
+    <script src="/static/app.js?v=20260618-01"></script>
+    <script src="/static/api-presets.js?v=20260618-01"></script>
+    <script src="/static/secret-toggle.js?v=20260616-16"></script>
   </body>
 </html>
