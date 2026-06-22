@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -55,6 +55,14 @@ JOB_TASKS: dict[str, asyncio.Task[Any]] = {}
 # 1) 历史文件（generation-history.json）是“读—改—写”，并发会丢条目，加进程内锁。
 # 2) 同时进行的批量生成数量需要有上限，避免本地模型/远端 API 被打爆。1-4 名同学合用一台机。
 MAX_CONCURRENT_BATCH_JOBS = int(os.getenv("MAX_CONCURRENT_BATCH_JOBS", "4") or "4")
+# 3) 批量里单条 AI 调用偶发瞬时失败（超时 / 502 / 503 / 504 / 429 / 连接中断）很常见，
+#    不重试的话一条失败就会让整批中止，甚至第一块就挂、一篇都写不出来。这里对瞬时错误
+#    做有限次指数退避重试。这些可用环境变量覆盖。
+AI_RETRY_ATTEMPTS = max(1, int(os.getenv("AI_RETRY_ATTEMPTS", "3") or "3"))
+AI_RETRY_BASE_DELAY = float(os.getenv("AI_RETRY_BASE_DELAY", "1.5") or "1.5")
+AI_RETRY_MAX_DELAY = float(os.getenv("AI_RETRY_MAX_DELAY", "12") or "12")
+# 这些 HTTP 状态码视为瞬时错误，可重试；4xx 配置类错误（如 401/400）不重试。
+AI_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _HISTORY_FILE_LOCK = threading.Lock()
 BATCH_SLOTS: asyncio.Semaphore | None = None
 
@@ -65,8 +73,30 @@ def get_batch_slots() -> asyncio.Semaphore:
         BATCH_SLOTS = asyncio.Semaphore(max(1, MAX_CONCURRENT_BATCH_JOBS))
     return BATCH_SLOTS
 
+
+HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global HTTP_CLIENT
+    if HTTP_CLIENT is None:
+        HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
+        )
+    return HTTP_CLIENT
+
+
 app = FastAPI(title="AI Document Form Filler")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global HTTP_CLIENT
+    if HTTP_CLIENT is not None:
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
 
 
 @app.exception_handler(Exception)
@@ -615,8 +645,9 @@ async def create_fill_job(
     if not fields:
         fields = default_training_log_fields()
 
-    # 并发度限制在 1–4 之间。前端会传 1/2/3/4，超出范围安全裁剪。
-    parallel_count = max(1, min(4, int(parallel_count or 1)))
+    # 并发度：本地模型（ollama）上限 4，远程 API 用户自定义（上限 64）。
+    max_parallel = 64 if api_format != "ollama" else 4
+    parallel_count = max(1, min(max_parallel, int(parallel_count or 1)))
 
     records = parse_selected_records(selected_records)
     if not records:
@@ -996,7 +1027,7 @@ async def fill_form(
         download_url = ""
         folder_path = ""
         if saved_path.suffix.lower() == ".docx":
-            output_path = package_batch_outputs(saved_path, batch_result["records"], output_format, output_package_mode)
+            output_path = await package_batch_outputs(saved_path, batch_result["records"], output_format, output_package_mode)
             if output_path.is_dir():
                 folder_path = output_folder_display_path(output_path)
                 folder_files = output_folder_file_links(output_path)
@@ -1064,8 +1095,8 @@ async def fill_form(
     result["answers"] = enrich_answers_for_fields(result.get("answers", []), fields)
     download_url = ""
     if saved_path.suffix.lower() == ".docx":
-        output_path = fill_docx_template(saved_path, result["answers"], title_from_answers(result["answers"], original_filename))
-        output_path = convert_output_format(output_path, output_format)
+        output_path = await asyncio.to_thread(fill_docx_template, saved_path, result["answers"], title_from_answers(result["answers"], original_filename))
+        output_path = await convert_output_format(output_path, output_format)
         download_url = f"/download/{output_path.name}"
 
     payload = {
@@ -1697,7 +1728,10 @@ def resume_job_to_run_args(state: dict[str, Any], api_config: dict[str, str] | N
             "selected_modules": defaults.get("selected_modules") if isinstance(defaults.get("selected_modules"), list) else [],
             "link_module_teacher": bool(defaults.get("link_module_teacher")),
             "module_teacher_map": defaults.get("module_teacher_map") if isinstance(defaults.get("module_teacher_map"), dict) else {},
-            "parallel_count": max(1, min(4, int(defaults.get("parallel_count") or 1))),
+            # 续写时保留用户原本设置的并发数（上限 64 防溢出），真正的按 API 类型上限
+            # 由 run 批量函数里的 max_parallel 统一裁剪，这里不要再硬性压到 4，否则
+            # 中断后继续生成会把并发回落到默认值。
+            "parallel_count": max(1, min(64, int(defaults.get("parallel_count") or 1))),
         },
         "custom_prompt": str(state.get("custom_prompt") or ""),
         "custom_skills": str(state.get("custom_skills") or ""),
@@ -1882,22 +1916,39 @@ def history_record_titles(records: list[dict[str, Any]]) -> list[str]:
 
 
 def summarize_history_stats(payload: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
-    stats_items: list[dict[str, Any]] = []
-    if isinstance(payload.get("generation_stats"), dict):
-        stats_items.append(payload["generation_stats"])
+    # 收集每篇记录的 token 统计
+    record_stats: list[dict[str, Any]] = []
     for record in records:
         stats = record.get("generation_stats")
         if isinstance(stats, dict):
-            stats_items.append(stats)
-    if not stats_items:
-        return {"duration_seconds": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
-    return {
-        "duration_seconds": round(sum(float(item.get("duration_seconds") or 0) for item in stats_items), 2),
-        "total_tokens": sum(int(item.get("total_tokens") or 0) for item in stats_items),
-        "input_tokens": sum(int(item.get("input_tokens") or 0) for item in stats_items),
-        "output_tokens": sum(int(item.get("output_tokens") or 0) for item in stats_items),
-        "token_source": stats_items[0].get("token_source", ""),
+            record_stats.append(stats)
+    total_tokens = sum(int(item.get("total_tokens") or 0) for item in record_stats)
+    input_tokens = sum(int(item.get("input_tokens") or 0) for item in record_stats)
+    output_tokens = sum(int(item.get("output_tokens") or 0) for item in record_stats)
+    token_source = record_stats[0].get("token_source", "") if record_stats else ""
+    # 耗时：优先使用 payload 级别的挂钟时间（并行批量），避免把并行的 AI 调用时长叠加统计
+    top_stats = payload.get("generation_stats") if isinstance(payload.get("generation_stats"), dict) else {}
+    if top_stats.get("wall_clock") and top_stats.get("duration_seconds"):
+        duration = round(float(top_stats["duration_seconds"]), 2)
+        parallel = int(top_stats.get("parallel") or 1)
+    else:
+        duration = round(sum(float(item.get("duration_seconds") or 0) for item in record_stats), 2)
+        parallel = 1
+    # 补充 top_stats 里可能有的 token 信息
+    if isinstance(top_stats, dict):
+        total_tokens = total_tokens or int(top_stats.get("total_tokens") or 0)
+        input_tokens = input_tokens or int(top_stats.get("input_tokens") or 0)
+        output_tokens = output_tokens or int(top_stats.get("output_tokens") or 0)
+    result: dict[str, Any] = {
+        "duration_seconds": duration,
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "token_source": token_source,
     }
+    if parallel > 1:
+        result["parallel"] = parallel
+    return result
 
 
 def history_downloads(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -2326,6 +2377,7 @@ async def run_fill_job(
         if queued_msg is not None:
             job["message"] = queued_msg
     try:
+        batch_wall_clock_start = time.perf_counter()
         if resume_state:
             resume_state["status"] = "running"
             resume_state["used_ai"] = used_ai
@@ -2335,20 +2387,54 @@ async def run_fill_job(
         # 并行生成：按 parallel_count 分块处理 selected_records，
         # 每块内 AI 调用 asyncio.gather 并行；块内 AI 结果按原顺序写文件、追加到 generated_records，
         # 保证 resume 状态依然按 selected_records 的顺序对齐。
-        parallel = max(1, min(4, int(defaults.get("parallel_count") or 1)))
+        is_remote_api = api_config.get("format") != "ollama"
+        max_parallel = 64 if is_remote_api else 4
+        parallel = max(1, min(max_parallel, int(defaults.get("parallel_count") or 1)))
         pending = list(enumerate(selected_records[start_index:], start=start_index + 1))
 
         async def _ai_one(record_in: dict[str, Any]) -> dict[str, Any]:
-            result = await generate_selected_records_one_by_one(
-                document_text,
-                requirements_text,
-                [record_in],
-                fields,
-                api_config,
-                custom_prompt,
-                custom_skills,
-            )
-            return result["records"][0] if result.get("records") else record_in
+            # 瞬时错误（超时 / 5xx / 429 / 连接中断）做有限次指数退避重试，
+            # 避免单条偶发失败把整批拖垮。配置类 4xx 错误不重试，直接抛出。
+            last_exc: HTTPException | None = None
+            for attempt in range(1, AI_RETRY_ATTEMPTS + 1):
+                try:
+                    result = await generate_selected_records_one_by_one(
+                        document_text,
+                        requirements_text,
+                        [record_in],
+                        fields,
+                        api_config,
+                        custom_prompt,
+                        custom_skills,
+                    )
+                except HTTPException as exc:
+                    status = exc.status_code if isinstance(exc.status_code, int) else 0
+                    code = ai_error_code(exc)
+                    # 无效 JSON 是确定性错误（内部已自动修复重试过一次），外层不再反复重试，
+                    # 直接带错误码抛出，省得让用户干等好几个超时周期。
+                    can_retry = (
+                        status in AI_RETRYABLE_STATUS
+                        and not is_invalid_ai_json_error(exc)
+                        and attempt < AI_RETRY_ATTEMPTS
+                        and not job.get("cancel_requested")
+                    )
+                    if can_retry:
+                        last_exc = exc
+                        delay = min(AI_RETRY_BASE_DELAY * (2 ** (attempt - 1)), AI_RETRY_MAX_DELAY)
+                        rec_title = str(record_in.get("title") or "训练日志")
+                        # 把重试情况写进任务进度，避免界面长时间“看着没反应”。
+                        job["message"] = (
+                            f"「{rec_title}」调用失败 [{code}]，{delay:.0f}s 后重试"
+                            f"（第 {attempt + 1}/{AI_RETRY_ATTEMPTS} 次）…"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+                else:
+                    return result["records"][0] if result.get("records") else record_in
+            if last_exc is not None:
+                raise last_exc
+            return record_in
 
         while pending:
             if job.get("cancel_requested"):
@@ -2365,15 +2451,29 @@ async def run_fill_job(
                 resume_state["current"] = first_title
                 resume_state["message"] = job["message"]
                 save_resume_job(resume_state)
+            chunk_error: BaseException | None = None
             if used_ai:
-                ai_records = await asyncio.gather(*[_ai_one(sr) for _, sr in chunk])
+                # return_exceptions=True：块内任意一条失败不会连带丢掉同块其它已成功的结果。
+                ai_results = await asyncio.gather(
+                    *[_ai_one(sr) for _, sr in chunk], return_exceptions=True
+                )
+                # 只取“首个失败之前”的连续成功结果，保证 resume 的 completed 下标连续对齐，
+                # 不会在中间留空洞。失败留到下面落盘已完成部分后再抛出，走 partial + 续写。
+                ai_records = []
+                for res in ai_results:
+                    if isinstance(res, BaseException):
+                        chunk_error = res
+                        break
+                    ai_records.append(res)
             else:
                 ai_records = []
                 for _, sr in chunk:
                     rec = sr
                     rec["generation_stats"] = fallback_generation_stats(0)
                     ai_records.append(rec)
-            # AI 调用全部返回后，按块内原顺序串行写文件，避免 used_names / generated_paths 竞态。
+            # AI 调用返回后，按块内原顺序串行写文件，避免 used_names / generated_paths 竞态。
+            written_index = start_index
+            last_title = ""
             for (index, _selected_record), record in zip(chunk, ai_records):
                 if job.get("cancel_requested"):
                     raise asyncio.CancelledError()
@@ -2388,8 +2488,8 @@ async def run_fill_job(
                 )
                 record["answers"] = enrich_answers_for_fields(record.get("answers", []), fields)
                 output_title = record_file_title(record, index)
-                output_path = fill_docx_template(template_path, record.get("answers", []), output_title)
-                output_path = convert_output_format(output_path, output_format)
+                output_path = await asyncio.to_thread(fill_docx_template, template_path, record.get("answers", []), output_title)
+                output_path = await convert_output_format(output_path, output_format)
                 file_name = unique_package_filename(f"{safe_filename(output_title)}{output_path.suffix}", used_names)
                 if output_folder:
                     target_path = output_folder / file_name
@@ -2398,23 +2498,29 @@ async def run_fill_job(
                 else:
                     generated_paths.append((output_path, file_name))
                 generated_records.append(record)
-            # 块整体完成后再统一刷状态、写盘，比每篇都写一次更省。
-            last_index = chunk[-1][0]
-            last_title = str(chunk[-1][1].get("title") or f"training-log-{last_index}")
-            job["completed"] = last_index
-            job["current"] = last_title
-            job["message"] = f"已写入第 {last_index}/{len(selected_records)} 篇：{last_title}"
-            if resume_state:
-                resume_state["completed"] = last_index
-                resume_state["generated_records"] = generated_records
-                resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
-                resume_state["message"] = job["message"]
-                save_resume_job(resume_state)
+                written_index = index
+                last_title = str(_selected_record.get("title") or record.get("title") or f"training-log-{index}")
+            # 已写入部分统一刷状态、写盘（可能只是本块的前缀）。
+            if ai_records:
+                job["completed"] = written_index
+                job["current"] = last_title
+                job["message"] = f"已写入第 {written_index}/{len(selected_records)} 篇：{last_title}"
+                if resume_state:
+                    resume_state["completed"] = written_index
+                    resume_state["generated_records"] = generated_records
+                    resume_state["generated_files"] = output_folder_file_links(output_folder) if output_folder else []
+                    resume_state["message"] = job["message"]
+                    save_resume_job(resume_state)
+            # 本块有失败：已完成进度已落盘，这里抛出交给外层 except 走 partial_result + 续写，
+            # 剩余未完成的篇数可在“未完成批量任务”里继续。
+            if chunk_error is not None:
+                raise chunk_error
 
         job["message"] = "正在整理下载文件..."
         package_path = output_folder if output_folder else write_generated_package(generated_paths, generated_records, output_package_mode, defaults.get("default_writer", ""))
         job["status"] = "complete"
         job["message"] = "批量生成完成。"
+        batch_wall_clock_seconds = round(time.perf_counter() - batch_wall_clock_start, 2)
         job["result"] = {
             "filename": original_filename,
             "used_ai": used_ai,
@@ -2428,6 +2534,11 @@ async def run_fill_job(
             "folder_zip_url": output_folder_zip_url(package_path) if package_path.is_dir() else "",
             "source_preview": document_text[:1200],
             "requirements_preview": requirements_text[:1200],
+            "generation_stats": {
+                "duration_seconds": batch_wall_clock_seconds,
+                "wall_clock": True,
+                "parallel": parallel,
+            },
         }
         entry = append_generation_history(
             build_history_entry_from_context(
@@ -2629,7 +2740,9 @@ def output_folder_zip_url(path: Path) -> str:
 
 
 def resolve_output_folder(folder: str) -> Path:
-    if not re.fullmatch(r"[a-f0-9]{32}(?:-[\w\u4e00-\u9fff.-]+)?", folder):
+    # \u517c\u5bb9\u4e24\u79cd\u6587\u4ef6\u5939\u547d\u540d\uff1a\u65e7\u7684 uuid \u524d\u7f00\u683c\u5f0f \u548c \u65b0\u7684\u53ef\u8bfb\u98ce\u683c\uff08\u5982 "6.1\u7b4926\u5929\u8bad\u7ec3\u65e5\u5fd7-2"\uff09\u3002
+    # \u5b89\u5168\u68c0\u67e5\uff1a\u7981\u6b62\u8def\u5f84\u7a7f\u8d8a\u5b57\u7b26\uff0c\u540e\u9762\u8fd8\u4f1a\u7528 resolve() \u505a\u4e8c\u6b21\u6821\u9a8c\u3002
+    if not folder or ".." in folder or "/" in folder or "\\" in folder or not re.fullmatch(r"[\w\u4e00-\u9fff. -]+", folder):
         raise HTTPException(status_code=404, detail="File not found.")
     folder_path = (OUTPUT_DIR / folder).resolve()
     output_root = OUTPUT_DIR.resolve()
@@ -2693,9 +2806,9 @@ async def parse_plan_upload(plan_file: UploadFile | None, fields: list[dict[str,
     if not content:
         return []
     if suffix in {".xlsx", ".xlsm"}:
-        return parse_plan_xlsx(content, fields)
+        return await asyncio.to_thread(parse_plan_xlsx, content, fields)
     if suffix in {".txt", ".csv", ".tsv"}:
-        return parse_training_plan_table(content.decode("utf-8", errors="ignore"), fields)
+        return await asyncio.to_thread(parse_training_plan_table, content.decode("utf-8", errors="ignore"), fields)
     raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
 
 
@@ -3314,8 +3427,26 @@ async def generate_batch_records(
         stats = combine_generation_stats([item["generation_stats"] for item in raw_results])
     else:
         raw_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
-        records = parse_batch_json(raw_result["content"])
-        stats = raw_result["generation_stats"]
+        raw_results = [raw_result]
+        try:
+            records = parse_batch_json(raw_result["content"])
+        except HTTPException as exc:
+            if not is_invalid_ai_json_error(exc):
+                raise
+            # 远端模型也常把 JSON 包在 markdown / 说明文字里，或被 max_tokens 截断。
+            # 和 ollama 路径一样自动做 1 次“只输出 JSON”的修复重试，避免“模型回了但日志没出来”。
+            repair_prompt = build_batch_json_retry_prompt(prompt, raw_result["content"])
+            repair_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, repair_prompt)
+            raw_results.append(repair_result)
+            try:
+                records = parse_batch_json(repair_result["content"])
+            except HTTPException as retry_exc:
+                detail = retry_exc.detail if isinstance(retry_exc.detail, str) else str(retry_exc.detail)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"远端模型返回内容不是可用 JSON，已自动做 1 次格式修复重试仍失败：{detail}",
+                ) from retry_exc
+        stats = combine_generation_stats([item["generation_stats"] for item in raw_results])
     attach_stats_to_records(records, stats)
     return {"used_ai": True, "records": records}
 
@@ -3344,7 +3475,8 @@ async def generate_selected_records_one_by_one(
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
             title = record.get("title") or f"第 {index} 条记录"
-            raise HTTPException(status_code=exc.status_code, detail=f"{title} 生成失败：{detail}") from exc
+            code = ai_error_code(exc)
+            raise HTTPException(status_code=exc.status_code, detail=f"{title} 生成失败 [{code}]：{detail}") from exc
         else:
             generated = result.get("records", [])
         if generated:
@@ -3378,22 +3510,23 @@ async def call_openai_compatible_raw_with_stats(base_url: str, api_key: str, mod
             write=30.0,
             pool=30.0,
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "请根据输入生成训练日志内容。",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.1,
-                },
-            )
+        client = get_http_client()
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "请根据输入生成训练日志内容。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+            },
+            timeout=timeout,
+        )
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
@@ -3428,11 +3561,12 @@ async def call_openai_compatible_raw_with_stats(base_url: str, api_key: str, mod
 
 async def list_openai_compatible_models(base_url: str, api_key: str, current_model: str) -> list[str]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+        client = get_http_client()
+        response = await client.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30.0,
+        )
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
@@ -3466,23 +3600,24 @@ async def call_ollama_raw_with_stats(base_url: str, model: str, prompt: str, api
             write=30.0,
             pool=30.0,
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{base_url}/api/chat",
-                headers=ollama_headers(api_key),
-                json={
-                    "model": model,
-                    "stream": False,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "请根据输入生成训练日志内容。只返回合法 JSON，不要返回解释、Markdown 代码块或 <think> 内容。",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "options": {"temperature": 0.1},
-                },
-            )
+        client = get_http_client()
+        response = await client.post(
+            f"{base_url}/api/chat",
+            headers=ollama_headers(api_key),
+            json={
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "请根据输入生成训练日志内容。只返回合法 JSON，不要返回解释、Markdown 代码块或 <think> 内容。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {"temperature": 0.1},
+            },
+            timeout=timeout,
+        )
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
@@ -3549,17 +3684,18 @@ async def ensure_ollama_model(config: dict[str, str]) -> None:
 async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str | int, api_key: str = "") -> None:
     try:
         timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{base_url}/api/generate",
-                headers=ollama_headers(api_key),
-                json={
-                    "model": model,
-                    "prompt": "",
-                    "stream": False,
-                    "keep_alive": keep_alive,
-                },
-            )
+        client = get_http_client()
+        response = await client.post(
+            f"{base_url}/api/generate",
+            headers=ollama_headers(api_key),
+            json={
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": keep_alive,
+            },
+            timeout=timeout,
+        )
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
@@ -3576,8 +3712,8 @@ async def set_ollama_model_keep_alive(base_url: str, model: str, keep_alive: str
 
 async def list_ollama_models(base_url: str, api_key: str = "") -> list[str]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{base_url}/api/tags", headers=ollama_headers(api_key))
+        client = get_http_client()
+        response = await client.get(f"{base_url}/api/tags", headers=ollama_headers(api_key), timeout=30.0)
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=502,
@@ -3622,8 +3758,8 @@ async def detect_nvidia_gpus() -> list[dict[str, Any]]:
 
 async def read_ollama_processors(base_url: str) -> list[str]:
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(f"{base_url}/api/ps")
+        client = get_http_client()
+        response = await client.get(f"{base_url}/api/ps", timeout=10.0)
     except httpx.HTTPError:
         return []
     if response.status_code >= 400:
@@ -3769,7 +3905,28 @@ def looks_like_batch_record(value: dict[str, Any]) -> bool:
 
 def is_invalid_ai_json_error(exc: HTTPException) -> bool:
     detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-    return exc.status_code == 502 and "invalid" in detail.lower() and "json" in detail.lower()
+    # 凡是 502 且提到 JSON 的，都按“模型输出不是可用 JSON”处理：首次触发自动修复重试，
+    # 修复仍失败后外层不再反复重试（确定性错误），并统一映射到 AI_BAD_JSON 错误码。
+    return exc.status_code == 502 and "json" in detail.lower()
+
+
+def ai_error_code(exc: HTTPException) -> str:
+    """把一次失败映射成简短错误码，方便用户在界面上一眼看出生成不出来的原因。"""
+    status = exc.status_code if isinstance(exc.status_code, int) else 0
+    if is_invalid_ai_json_error(exc):
+        return "AI_BAD_JSON"
+    return {
+        400: "AI_BAD_REQUEST",
+        401: "AI_AUTH",
+        403: "AI_AUTH",
+        404: "AI_MODEL_NOT_FOUND",
+        408: "AI_TIMEOUT",
+        429: "AI_RATE_LIMIT",
+        500: "AI_SERVER",
+        502: "AI_UPSTREAM",
+        503: "AI_UNAVAILABLE",
+        504: "AI_TIMEOUT",
+    }.get(status, f"AI_HTTP_{status or 'ERR'}")
 
 
 def json_text_candidates(content: str) -> list[str]:
@@ -4124,7 +4281,7 @@ def fill_docx_template(template_path: Path, answers: list[dict[str, Any]], outpu
     return output_path
 
 
-def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], output_format: str, package_mode: str) -> Path:
+async def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], output_format: str, package_mode: str) -> Path:
     if not records:
         raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
     normalized_format = (output_format or "docx").strip().lower()
@@ -4139,9 +4296,9 @@ def package_batch_outputs(template_path: Path, records: list[dict[str, Any]], ou
 
     for index, record in enumerate(records, start=1):
         output_title = record_file_title(record, index)
-        output_path = fill_docx_template(template_path, record.get("answers", []), output_title)
+        output_path = await asyncio.to_thread(fill_docx_template, template_path, record.get("answers", []), output_title)
         if normalized_format == "pdf":
-            output_path = convert_docx_to_pdf(output_path)
+            output_path = await convert_docx_to_pdf(output_path)
         file_name = unique_package_filename(f"{safe_filename(output_title)}{output_path.suffix}", used_names)
         generated_paths.append((output_path, file_name))
 
@@ -4306,21 +4463,21 @@ def append_doc_body(target_doc: Document, source_doc: Document) -> None:
         target_body.append(deepcopy(element))
 
 
-def convert_output_format(docx_path: Path, output_format: str) -> Path:
+async def convert_output_format(docx_path: Path, output_format: str) -> Path:
     normalized = (output_format or "docx").strip().lower()
     if normalized in {"docx", "word"}:
         return docx_path
     if normalized != "pdf":
         raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
-    return convert_docx_to_pdf(docx_path)
+    return await convert_docx_to_pdf(docx_path)
 
 
-def convert_docx_to_pdf(docx_path: Path) -> Path:
+async def convert_docx_to_pdf(docx_path: Path) -> Path:
     soffice = shutil.which("libreoffice") or shutil.which("soffice")
     if not soffice:
         raise HTTPException(status_code=500, detail="请求失败，请检查输入或 API 配置。")
-    result = subprocess.run(
-        [
+    try:
+        process = await asyncio.create_subprocess_exec(
             soffice,
             "--headless",
             "--convert-to",
@@ -4328,16 +4485,25 @@ def convert_docx_to_pdf(docx_path: Path) -> Path:
             "--outdir",
             str(OUTPUT_DIR),
             str(docx_path),
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=90,
-    )
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=90)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+            await process.wait()
+        except Exception:
+            pass
+        raise HTTPException(status_code=504, detail="PDF 转换超时。")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF 转换进程启动失败：{exc}")
+
     pdf_path = docx_path.with_suffix(".pdf")
-    if result.returncode != 0 or not pdf_path.exists():
-        detail = (result.stderr or result.stdout or "LibreOffice 没有返回可用错误信息。").strip()
+    if process.returncode != 0 or not pdf_path.exists():
+        stdout = stdout_bytes.decode(errors="ignore")
+        stderr = stderr_bytes.decode(errors="ignore")
+        detail = (stderr or stdout or "LibreOffice 没有返回可用错误信息。").strip()
         raise HTTPException(status_code=500, detail=f"PDF 导出失败：{detail[:500]}")
     return pdf_path
 

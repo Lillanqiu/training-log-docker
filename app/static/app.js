@@ -2013,14 +2013,26 @@ function failBatchProgress(message, partialPayload = null, options = {}) {
 }
 
 function batchFailureTitle(message) {
-  const text = String(message || "").toLowerCase();
-  if (text.includes("json") || text.includes("records must") || text.includes("输出格式")) {
-    return "模型输出格式错误";
+  const raw = String(message || "");
+  // 后端会在失败信息里带上 [AI_XXX] 错误码，优先把它显示在标题上，方便一眼定位。
+  const codeMatch = raw.match(/\[(AI_[A-Z0-9_]+|PDF_[A-Z0-9_]+)\]/);
+  const code = codeMatch ? codeMatch[1] : "";
+  const text = raw.toLowerCase();
+  let label = "批量生成中断";
+  if (code === "AI_BAD_JSON" || text.includes("json") || text.includes("records must") || text.includes("输出格式")) {
+    label = "模型输出格式错误";
+  } else if (code === "AI_TIMEOUT" || text.includes("timeout") || text.includes("超时")) {
+    label = "模型请求超时";
+  } else if (code === "AI_AUTH") {
+    label = "API 密钥/权限错误";
+  } else if (code === "AI_RATE_LIMIT") {
+    label = "API 触发限流";
+  } else if (code === "AI_MODEL_NOT_FOUND") {
+    label = "模型名不存在";
+  } else if (code === "AI_UPSTREAM" || code === "AI_UNAVAILABLE" || code === "AI_SERVER") {
+    label = "API 服务异常";
   }
-  if (text.includes("timeout") || text.includes("超时")) {
-    return "模型请求超时";
-  }
-  return "批量生成中断";
+  return code ? `${label}（${code}）` : label;
 }
 
 function resetBatchProgress() {
@@ -2382,12 +2394,14 @@ function createHistoryItemNode(item) {
   const recovered = recoveredFlag;
   // 速率仍以输出 token 为口径（输入是 prompt 解码，速度本来就远高于生成）。
   const durationSec = Number(stats.duration_seconds || 0);
+  const parallelCount = Number(stats.parallel || 0);
   const outputTok = Number(stats.output_tokens || 0);
   const totalTok = Number(stats.total_tokens || 0);
   const speedTok = outputTok > 0 ? outputTok : totalTok;
   const tps = (durationSec > 0 && speedTok > 0) ? (speedTok / durationSec).toFixed(1) : "";
   const tokenText = totalTok ? `Token ${totalTok}` : "Token 未统计";
-  const durationText = durationSec ? `耗时 ${durationSec.toFixed(1)} 秒` : "耗时未统计";
+  const durationLabel = parallelCount > 1 ? `耗时 ${durationSec.toFixed(1)} 秒（${parallelCount} 路并发）` : (durationSec ? `耗时 ${durationSec.toFixed(1)} 秒` : "耗时未统计");
+  const durationText = durationLabel;
   const speedText = tps ? `速率 ${tps} token/s` : "";
   meta.textContent = [
     `生成用户：${item.generated_user || "未填写"}`,
@@ -2949,12 +2963,25 @@ if (shareSettingsSaveBtn) {
   });
 }
 
-// 设置面板里的"并行" → 主表单的 #parallel-count 同步
+// 设置面板 ↔ 主表单双向同步（加 _syncing 防循环）
+let _parallelSyncing = false;
 function syncParallelToMainForm() {
+  if (_parallelSyncing) return;
+  _parallelSyncing = true;
   const enabled = document.querySelector("#settings-parallel-enabled")?.checked !== false;
   const count = parseInt(document.querySelector("#settings-parallel-count")?.value || "2", 10);
-  const mainSelect = document.querySelector("#parallel-count");
-  if (mainSelect) mainSelect.value = String(enabled ? Math.max(1, Math.min(4, count)) : 1);
+  const mainInput = document.querySelector("#parallel-count");
+  if (mainInput) mainInput.value = String(enabled ? Math.max(1, count) : 1);
+  _parallelSyncing = false;
+}
+function syncParallelToSettings() {
+  if (_parallelSyncing) return;
+  _parallelSyncing = true;
+  const val = parseInt(document.querySelector("#parallel-count")?.value || "2", 10);
+  const settingsInput = document.querySelector("#settings-parallel-count");
+  if (settingsInput) settingsInput.value = String(Math.max(1, val));
+  try { localStorage.setItem("parallel_count", String(Math.max(1, val))); } catch (_) {}
+  _parallelSyncing = false;
 }
 
 // 设置面板首次打开时，把存的偏好读回来；如果没存过，默认开 + 2
@@ -2965,14 +2992,18 @@ function syncParallelToMainForm() {
     if (sw) sw.checked = localStorage.getItem("parallel_enabled") !== "0";
     if (cnt) cnt.value = localStorage.getItem("parallel_count") || "2";
   } catch (_) {}
-  // 改完立即同步，不用等保存
+  // 设置面板 → 主表单
   document.querySelector("#settings-parallel-enabled")?.addEventListener("change", () => {
     try { localStorage.setItem("parallel_enabled", document.querySelector("#settings-parallel-enabled").checked ? "1" : "0"); } catch (_) {}
     syncParallelToMainForm();
   });
-  document.querySelector("#settings-parallel-count")?.addEventListener("change", () => {
+  document.querySelector("#settings-parallel-count")?.addEventListener("input", () => {
     try { localStorage.setItem("parallel_count", document.querySelector("#settings-parallel-count").value); } catch (_) {}
     syncParallelToMainForm();
+  });
+  // 主表单 → 设置面板
+  document.querySelector("#parallel-count")?.addEventListener("input", () => {
+    syncParallelToSettings();
   });
   syncParallelToMainForm();
 })();

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI 训练日志填写</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260616-19" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260619-01" />
   </head>
   <body>
     <section id="login-screen" class="login-screen">
@@ -91,7 +91,7 @@
               </label>
               <label class="field">
                 <span>强推的 skills（留空就用你当前表单里的）</span>
-                <textarea id="shared-skills-text" rows="4" spellcheck="false" placeholder="只有想让别人都看到这一段、不要用你表单里的当前内容时才填。"></textarea>
+                <textarea id="shared-skills-text" rows="10" spellcheck="false" placeholder="只有想让别人都看到这一段、不要用你表单里的当前内容时才填。"></textarea>
               </label>
             </div>
           </details>
@@ -105,15 +105,10 @@
             </label>
           </div>
           <label class="field">
-            <span>并行数量</span>
-            <select id="settings-parallel-count">
-              <option value="1">1（一篇一篇写，最稳）</option>
-              <option value="2" selected>2（推荐，速度翻倍）</option>
-              <option value="3">3（更快，更吃显存）</option>
-              <option value="4">4（最快，注意 GPU 是否扛得住）</option>
-            </select>
+            <span>并行数量（本地模型建议 1-4，远程 API 可更高）</span>
+            <input id="settings-parallel-count" type="number" min="1" max="64" step="1" value="2" />
           </label>
-          <p class="subtle share-settings-tip">这两项改完会同步到主表单"并行生成"那一栏，提交任务时按这里的值跑。</p>
+          <p class="subtle share-settings-tip">本地模型（Ollama）最高 4 并行，远程 API（OpenAI 等）最高 64 并行。可自由输入数值，超出上限会自动裁剪。</p>
 
           <div class="actions">
             <button id="share-settings-save" type="button">保存设置</button>
@@ -449,12 +444,7 @@
 
           <label class="field auto-fill-panel hidden">
             <span>并行生成（同一任务里同时写几篇）</span>
-            <select id="parallel-count" name="parallel_count">
-              <option value="1">1（一篇一篇写，最稳）</option>
-              <option value="2" selected>2（推荐，速度翻倍）</option>
-              <option value="3">3（更快，更吃显存）</option>
-              <option value="4">4（最快，注意 GPU 是否扛得住）</option>
-            </select>
+            <input id="parallel-count" name="parallel_count" type="number" min="1" max="64" step="1" value="2" />
           </label>
 
           <label class="field">
@@ -630,7 +620,7 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260618-01"></script>
+    <script src="/static/app.js?v=20260619-01"></script>
     <script src="/static/api-presets.js?v=20260618-01"></script>
     <script src="/static/secret-toggle.js?v=20260616-16"></script>
   </body>

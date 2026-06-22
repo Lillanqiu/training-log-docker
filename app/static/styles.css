@@ -1270,10 +1270,17 @@ button.mini {
 }
 
 @media (max-width: 820px) {
+  html {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
   body {
     height: auto;
     min-height: 100vh;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: scroll;
+    -webkit-overflow-scrolling: touch;
   }
 
   .shell {
@@ -1843,7 +1850,8 @@ button.secondary:hover {
 
 @media (max-width: 1100px) {
   .shell {
-    width: min(100% - 24px, 920px);
+    width: calc(100% - 16px);
+    max-width: none;
     height: auto;
     min-height: 100vh;
     overflow: visible;
@@ -1852,7 +1860,9 @@ button.secondary:hover {
   body {
     height: auto;
     min-height: 100vh;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: scroll;
+    -webkit-overflow-scrolling: touch;
   }
 
   .settings-toggle {
@@ -1883,7 +1893,7 @@ button.secondary:hover {
 @media (max-width: 720px) {
   .shell {
     width: 100%;
-    padding: 18px 10px;
+    padding: 18px 6px;
   }
 
   .hero {
@@ -3390,10 +3400,18 @@ button.secondary {
 }
 
 @media (max-width: 1180px) {
+  html {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
   body {
     height: auto;
     min-height: 100vh;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: scroll;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
   }
 
   .shell {
@@ -4038,5 +4056,55 @@ button.secondary:hover {
 
   .history-panel {
     grid-template-rows: auto auto auto auto minmax(180px, 1fr);
+  }
+}
+
+/* 竖屏 / 窄屏：内容区撑满，减少两侧空白 —— 放在文件最末尾确保优先级最高 */
+
+/* 竖屏方向（高 > 宽）：不管多宽，都撑满 */
+@media (orientation: portrait) {
+  .shell {
+    width: calc(100% - 16px) !important;
+    max-width: none !important;
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+  .panel {
+    padding: 16px 12px !important;
+  }
+}
+
+/* 横屏但窄（如小笔记本） */
+@media (max-width: 1320px) and (orientation: landscape) {
+  .shell {
+    width: calc(100% - 12px) !important;
+    max-width: none !important;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+}
+
+@media (max-width: 820px) {
+  .shell {
+    width: 100% !important;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+  }
+  .panel {
+    padding: 12px 8px !important;
+  }
+}
+
+/* 宽屏全屏：标题单行显示 */
+@media (min-width: 1100px) {
+  .hero h1 {
+    max-width: none !important;
+    white-space: nowrap !important;
+  }
+  .hero-main {
+    grid-template-columns: auto 1fr !important;
+  }
+  .hero-copy {
+    overflow: visible !important;
   }
 }
