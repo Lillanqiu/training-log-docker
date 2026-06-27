@@ -1464,13 +1464,29 @@ saveConfigButton.addEventListener("click", async () => {
 
 testApiButton.addEventListener("click", () => runApiTest());
 
+function currentApiFormat() {
+  return document.querySelector("#api-format")?.value || "openai";
+}
+
+function currentApiFormatLabel() {
+  const format = currentApiFormat();
+  if (format === "ollama") return "Ollama";
+  if (format === "gemini") return "Google Gemini API";
+  return "OpenAI 兼容";
+}
+
 async function runApiTest() {
   [testApiButton, quickApiTestButton].forEach((button) => {
     if (button) button.disabled = true;
   });
   setApiTestStatus("", "");
-  const isOllama = document.querySelector("#api-format").value === "ollama";
-  setApiTestStatus("", isOllama ? "正在检查 Ollama 和当前模型..." : "正在测试 API...");
+  const format = currentApiFormat();
+  setApiTestStatus(
+    "",
+    format === "ollama"
+      ? "正在检查 Ollama 和当前模型..."
+      : (format === "gemini" ? "正在测试 Gemini API..." : "正在测试 API...")
+  );
   try {
     const response = await postJsonWithRetry("/api/test-api", readApiConfig());
     const payload = await readResponse(response);
@@ -1595,7 +1611,7 @@ window.updateApiSummary = updateApiSummary;
 
 function updateApiSummary() {
   if (!currentApiSummary) return;
-  const format = document.querySelector("#api-format")?.value === "ollama" ? "Ollama" : "OpenAI 兼容";
+  const format = currentApiFormatLabel();
   const model = document.querySelector("#api-model")?.value || "未选择模型";
   const baseUrl = document.querySelector("#api-base-url")?.value || "未填写地址";
   const gpu = format === "Ollama" && gpuModelInput?.value ? ` / ${gpuModelInput.value}` : "";
@@ -1605,7 +1621,7 @@ function updateApiSummary() {
 window.syncOllamaModelControls = syncOllamaModelControls;
 
 function syncOllamaModelControls() {
-  const isOllama = document.querySelector("#api-format")?.value === "ollama";
+  const isOllama = currentApiFormat() === "ollama";
   [preloadModelButton, restartModelButton, unloadModelButton, quickPreloadModelButton, quickRestartModelButton, quickUnloadModelButton]
     .forEach((button) => {
       if (!button) return;
@@ -1619,7 +1635,7 @@ function syncOllamaModelControls() {
 }
 
 function readApiConfig() {
-  const format = document.querySelector("#api-format").value;
+  const format = currentApiFormat();
   return {
     format,
     base_url: document.querySelector("#api-base-url").value,

@@ -49,6 +49,30 @@ SESSION_COOKIE = "training_log_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
 OPENAI_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "300") or "300")
 OLLAMA_REQUEST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "900") or "900")
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+GEMINI_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+OLLAMA_DEFAULT_BASE_URL = "http://host.docker.internal:11434"
+OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
+OLLAMA_DEFAULT_MODEL = "qwen2.5:7b"
+SUPPORTED_API_FORMATS = frozenset({"openai", "gemini", "ollama"})
+DEPRECATED_GEMINI_MODEL_IDS = frozenset({
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+})
+DEPRECATED_GEMINI_MODEL_PREFIXES = (
+    "gemini-2.0-flash-",
+    "gemini-2.0-flash-lite-",
+)
+LEGACY_GEMINI_ALIAS_IDS = frozenset({
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+})
+LEGACY_GEMINI_PREVIEW_PREFIXES = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash-lite-preview",
+)
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_TASKS: dict[str, asyncio.Task[Any]] = {}
 # 多用户并发：FastAPI 是单进程 asyncio，多个生成任务天然并行，但有两处共享状态需要保护：
@@ -425,9 +449,9 @@ async def get_config(request: Request) -> dict[str, str]:
     if not config_path.exists():
         return {
             "format": "openai",
-            "base_url": "https://api.openai.com/v1",
+            "base_url": OPENAI_DEFAULT_BASE_URL,
             "api_key": "",
-            "model": "gpt-4.1-mini",
+            "model": OPENAI_DEFAULT_MODEL,
             "gpu_model": "",
         }
     return json.loads(config_path.read_text(encoding="utf-8"))
@@ -446,9 +470,9 @@ async def export_account_backup(request: Request) -> dict[str, Any]:
     config_path = api_config_path_for_user(user["username"])
     api_config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {
         "format": "openai",
-        "base_url": "https://api.openai.com/v1",
+        "base_url": OPENAI_DEFAULT_BASE_URL,
         "api_key": "",
-        "model": "gpt-4.1-mini",
+        "model": OPENAI_DEFAULT_MODEL,
         "gpu_model": "",
     }
     default_template = None
@@ -546,6 +570,10 @@ async def test_api_endpoint(payload: dict[str, str], request: Request) -> dict[s
                 "message": "Ollama 连接成功，当前模型可用。",
                 "preview": f"已识别 {len(models)} 个本地模型。",
             }
+        elif config["format"] == "gemini":
+            if not config["api_key"]:
+                raise HTTPException(status_code=400, detail="Gemini API 需要填写 API 密钥。")
+            content = await call_gemini_raw(config["base_url"], config["api_key"], config["model"], prompt)
         else:
             if not config["api_key"]:
                 raise HTTPException(status_code=400, detail="OpenAI 兼容接口需要填写 API 密钥。")
@@ -801,6 +829,10 @@ async def list_models_endpoint(payload: dict[str, str], request: Request) -> dic
     try:
         if config["format"] == "ollama":
             models = await list_ollama_models(config["base_url"], config["api_key"])
+        elif config["format"] == "gemini":
+            if not config["api_key"]:
+                raise HTTPException(status_code=400, detail="Gemini API 需要填写 API 密钥。")
+            models = await list_gemini_models(config["base_url"], config["api_key"], config["model"])
         else:
             if not config["api_key"]:
                 raise HTTPException(status_code=400, detail="请求失败，请检查输入或 API 配置。")
@@ -1231,17 +1263,24 @@ async def import_plan(
 
 
 def normalize_api_config(raw: dict[str, str]) -> dict[str, str]:
-    api_format = (raw.get("format") or "openai").strip()
-    if api_format not in {"openai", "ollama"}:
-        raise HTTPException(status_code=400, detail="api_format only supports openai or ollama.")
-    default_base = "http://host.docker.internal:11434" if api_format == "ollama" else "https://api.openai.com/v1"
-    default_model = "qwen2.5:7b" if api_format == "ollama" else "gpt-4.1-mini"
+    api_format = normalize_api_format(raw.get("format") or "openai")
+    if api_format not in SUPPORTED_API_FORMATS:
+        raise HTTPException(status_code=400, detail="api_format only supports openai, gemini or ollama.")
+    default_base = api_format_default_base_url(api_format)
+    default_model = api_format_default_model(api_format)
     model = (raw.get("model") or os.getenv("AI_MODEL") or default_model).strip()
     if api_format == "ollama":
         model = normalize_ollama_model_name(model)
+    elif api_format == "gemini":
+        model = normalize_gemini_model_name(model)
+    base_url = (raw.get("base_url") or os.getenv("AI_BASE_URL") or default_base).strip().rstrip("/")
+    if api_format == "ollama":
+        base_url = normalize_docker_host_url(base_url)
+    elif api_format == "gemini":
+        base_url = normalize_gemini_base_url(base_url)
     return {
         "format": api_format,
-        "base_url": normalize_docker_host_url((raw.get("base_url") or os.getenv("AI_BASE_URL") or default_base).strip().rstrip("/")),
+        "base_url": base_url,
         "api_key": (raw.get("api_key") or os.getenv("AI_API_KEY") or "").strip(),
         "model": model,
         "gpu_model": (raw.get("gpu_model") or "").strip(),
@@ -2145,6 +2184,55 @@ def normalize_docker_host_url(url: str) -> str:
     return re.sub(r"^(https?://)(localhost|127\.0\.0\.1)(:\d+)?", r"\1host.docker.internal\3", url, flags=re.IGNORECASE)
 
 
+def normalize_api_format(value: str) -> str:
+    return (value or "openai").strip().lower()
+
+
+def api_format_default_base_url(api_format: str) -> str:
+    if api_format == "ollama":
+        return OLLAMA_DEFAULT_BASE_URL
+    if api_format == "gemini":
+        return GEMINI_DEFAULT_BASE_URL
+    return OPENAI_DEFAULT_BASE_URL
+
+
+def api_format_default_model(api_format: str) -> str:
+    if api_format == "ollama":
+        return OLLAMA_DEFAULT_MODEL
+    if api_format == "gemini":
+        return GEMINI_DEFAULT_MODEL
+    return OPENAI_DEFAULT_MODEL
+
+
+def normalize_gemini_base_url(url: str) -> str:
+    value = (url or "").strip().rstrip("/")
+    if re.fullmatch(r"https?://generativelanguage\.googleapis\.com", value, flags=re.IGNORECASE):
+        return GEMINI_DEFAULT_BASE_URL
+    return value
+
+
+def normalize_gemini_model_name(model: str) -> str:
+    value = (model or "").strip()
+    return value.split("/", 1)[1] if value.lower().startswith("models/") else value
+
+
+def is_deprecated_gemini_model(model: str) -> bool:
+    value = normalize_gemini_model_name(model).lower()
+    return value in DEPRECATED_GEMINI_MODEL_IDS or any(value.startswith(prefix) for prefix in DEPRECATED_GEMINI_MODEL_PREFIXES)
+
+
+def is_legacy_gemini_alias_model(model: str) -> bool:
+    value = normalize_gemini_model_name(model).lower()
+    return value in LEGACY_GEMINI_ALIAS_IDS or any(value.startswith(prefix) for prefix in LEGACY_GEMINI_PREVIEW_PREFIXES)
+
+
+def is_visible_gemini_model(model: str) -> bool:
+    value = normalize_gemini_model_name(model).lower()
+    if not value:
+        return False
+    return not is_deprecated_gemini_model(value) and not is_legacy_gemini_alias_model(value)
+
+
 def normalize_ollama_model_name(model: str) -> str:
     model = model.strip()
     if ":" in model or not model:
@@ -2156,9 +2244,19 @@ def normalize_ollama_model_name(model: str) -> str:
 
 
 def can_use_ai(api_config: dict[str, str]) -> bool:
-    if api_config["format"] == "ollama":
-        return True
-    return bool(api_config["api_key"])
+    return (not format_requires_api_key(api_config["format"])) or bool(api_config["api_key"])
+
+
+def format_requires_api_key(api_format: str) -> bool:
+    return normalize_api_format(api_format) != "ollama"
+
+
+def gemini_headers(api_key: str) -> dict[str, str]:
+    return {"x-goog-api-key": api_key} if api_key else {}
+
+
+def gemini_auth_params(api_key: str) -> dict[str, str]:
+    return {"key": api_key} if api_key else {}
 
 
 def estimate_token_count(text: str) -> int:
@@ -3371,7 +3469,7 @@ async def generate_answers(
     base_url = api_config["base_url"]
     model = api_config["model"]
 
-    if api_format == "openai" and not api_key:
+    if format_requires_api_key(api_format) and not api_key:
         started = time.perf_counter()
         answers = heuristic_answers(document_text, requirements_text, fields)
         return {"used_ai": False, "answers": answers, "generation_stats": fallback_generation_stats(time.perf_counter() - started)}
@@ -3379,6 +3477,8 @@ async def generate_answers(
     prompt = build_prompt(document_text, requirements_text, fields, custom_prompt, custom_skills)
     if api_format == "ollama":
         return await call_ollama(base_url, model, prompt, api_config["api_key"])
+    if api_format == "gemini":
+        return await call_gemini(base_url, api_key, model, prompt)
     return await call_openai_compatible(base_url, api_key, model, prompt)
 
 
@@ -3398,7 +3498,7 @@ async def generate_batch_records(
     base_url = api_config["base_url"]
     model = api_config["model"]
 
-    if api_format == "openai" and not api_key:
+    if format_requires_api_key(api_format) and not api_key:
         started = time.perf_counter()
         records = heuristic_batch_records(document_text, requirements_text, fields)
         attach_stats_to_records(records, fallback_generation_stats(time.perf_counter() - started))
@@ -3426,7 +3526,9 @@ async def generate_batch_records(
                 ) from retry_exc
         stats = combine_generation_stats([item["generation_stats"] for item in raw_results])
     else:
-        raw_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, prompt)
+        raw_call = call_gemini_raw_with_stats if api_format == "gemini" else call_openai_compatible_raw_with_stats
+        provider_label = "Gemini API" if api_format == "gemini" else "远端模型"
+        raw_result = await raw_call(base_url, api_key, model, prompt)
         raw_results = [raw_result]
         try:
             records = parse_batch_json(raw_result["content"])
@@ -3436,7 +3538,7 @@ async def generate_batch_records(
             # 远端模型也常把 JSON 包在 markdown / 说明文字里，或被 max_tokens 截断。
             # 和 ollama 路径一样自动做 1 次“只输出 JSON”的修复重试，避免“模型回了但日志没出来”。
             repair_prompt = build_batch_json_retry_prompt(prompt, raw_result["content"])
-            repair_result = await call_openai_compatible_raw_with_stats(base_url, api_key, model, repair_prompt)
+            repair_result = await raw_call(base_url, api_key, model, repair_prompt)
             raw_results.append(repair_result)
             try:
                 records = parse_batch_json(repair_result["content"])
@@ -3444,7 +3546,7 @@ async def generate_batch_records(
                 detail = retry_exc.detail if isinstance(retry_exc.detail, str) else str(retry_exc.detail)
                 raise HTTPException(
                     status_code=502,
-                    detail=f"远端模型返回内容不是可用 JSON，已自动做 1 次格式修复重试仍失败：{detail}",
+                    detail=f"{provider_label} 返回内容不是可用 JSON，已自动做 1 次格式修复重试仍失败：{detail}",
                 ) from retry_exc
         stats = combine_generation_stats([item["generation_stats"] for item in raw_results])
     attach_stats_to_records(records, stats)
@@ -3578,6 +3680,123 @@ async def list_openai_compatible_models(base_url: str, api_key: str, current_mod
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=describe_ai_http_error(response.status_code, response.text, base_url, current_model))
     return extract_model_ids(response.json())
+
+
+async def call_gemini(
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+) -> dict[str, Any]:
+    raw_result = await call_gemini_raw_with_stats(base_url, api_key, model, prompt)
+    answers = parse_ai_json(raw_result["content"])
+    return {"used_ai": True, "answers": answers, "generation_stats": raw_result["generation_stats"]}
+
+
+async def call_gemini_raw(base_url: str, api_key: str, model: str, prompt: str) -> str:
+    result = await call_gemini_raw_with_stats(base_url, api_key, model, prompt)
+    return result["content"]
+
+
+async def call_gemini_raw_with_stats(base_url: str, api_key: str, model: str, prompt: str) -> dict[str, Any]:
+    started = time.perf_counter()
+    normalized_model = normalize_gemini_model_name(model)
+    try:
+        timeout = httpx.Timeout(
+            float(OPENAI_REQUEST_TIMEOUT_SECONDS),
+            connect=30.0,
+            read=float(OPENAI_REQUEST_TIMEOUT_SECONDS),
+            write=30.0,
+            pool=30.0,
+        )
+        client = get_http_client()
+        response = await client.post(
+            f"{base_url}/models/{normalized_model}:generateContent",
+            headers=gemini_headers(api_key),
+            params=gemini_auth_params(api_key),
+            json={
+                "systemInstruction": {
+                    "parts": [
+                        {
+                            "text": "请根据输入生成训练日志内容。只返回合法 JSON，不要返回解释、Markdown 代码块或 <think> 内容。",
+                        }
+                    ]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": prompt}],
+                    }
+                ],
+                "generationConfig": {"temperature": 0.1},
+            },
+            timeout=timeout,
+        )
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接 Gemini API：{base_url}。") from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Gemini API 请求超时：正式生成内容较长，模型在 {OPENAI_REQUEST_TIMEOUT_SECONDS} 秒内没有返回。当前模型：{normalized_model}。",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini API 请求失败：{type(exc).__name__}: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=describe_ai_http_error(response.status_code, response.text, base_url, normalized_model))
+    payload = response.json()
+    content = extract_gemini_text(payload)
+    usage = extract_gemini_usage(payload)
+    return {
+        "content": content,
+        "generation_stats": build_generation_stats(
+            "gemini",
+            normalized_model,
+            prompt,
+            content,
+            usage,
+            time.perf_counter() - started,
+            "api" if usage else "estimated",
+        ),
+    }
+
+
+async def list_gemini_models(base_url: str, api_key: str, current_model: str) -> list[str]:
+    try:
+        client = get_http_client()
+        page_token = ""
+        models: list[str] = []
+        while True:
+            params: dict[str, Any] = {"pageSize": 1000, **gemini_auth_params(api_key)}
+            if page_token:
+                params["pageToken"] = page_token
+            response = await client.get(
+                f"{base_url}/models",
+                headers=gemini_headers(api_key),
+                params=params,
+                timeout=30.0,
+            )
+            if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=describe_ai_http_error(response.status_code, response.text, base_url, normalize_gemini_model_name(current_model)),
+                )
+            payload = response.json()
+            models.extend(extract_gemini_model_ids(payload))
+            page_token = str(payload.get("nextPageToken") or "").strip()
+            if not page_token:
+                break
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接 Gemini API：{base_url}。") from exc
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini API 获取模型请求失败：{exc}") from exc
+
+    normalized_current_model = normalize_gemini_model_name(current_model)
+    if normalized_current_model and normalized_current_model not in models:
+        models.append(normalized_current_model)
+    return sorted(dedupe_preserve_text(models), key=str.lower)
 
 
 async def call_ollama(base_url: str, model: str, prompt: str, api_key: str = "") -> dict[str, Any]:
@@ -3792,6 +4011,58 @@ def extract_model_ids(payload: Any) -> list[str]:
         if model_id:
             models.append(model_id)
     return sorted(dedupe_preserve_text(models), key=str.lower)
+
+
+def extract_gemini_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    finish_reasons: list[str] = []
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
+            parts = content.get("parts") if isinstance(content.get("parts"), list) else []
+            text = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict)).strip()
+            if text:
+                return text
+            finish_reason = str(candidate.get("finishReason") or "").strip()
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+    prompt_feedback = payload.get("promptFeedback") if isinstance(payload, dict) and isinstance(payload.get("promptFeedback"), dict) else {}
+    block_reason = str(prompt_feedback.get("blockReason") or "").strip()
+    if block_reason:
+        raise HTTPException(status_code=502, detail=f"Gemini API 阻止了这次请求：{block_reason}。")
+    if finish_reasons:
+        raise HTTPException(status_code=502, detail=f"Gemini API 没有返回可用文本内容，finishReason={finish_reasons[0]}。")
+    raise HTTPException(status_code=502, detail="Gemini API 没有返回可用文本内容。")
+
+
+def extract_gemini_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usageMetadata") if isinstance(payload, dict) and isinstance(payload.get("usageMetadata"), dict) else {}
+    if not usage:
+        return {}
+    return {
+        "prompt_tokens": usage.get("promptTokenCount"),
+        "completion_tokens": usage.get("candidatesTokenCount"),
+        "total_tokens": usage.get("totalTokenCount"),
+    }
+
+
+def extract_gemini_model_ids(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    models: list[str] = []
+    for item in payload.get("models") or []:
+        if not isinstance(item, dict):
+            continue
+        supported_methods = item.get("supportedGenerationMethods") or item.get("supported_actions") or []
+        normalized_methods = {str(method or "").strip().lower() for method in supported_methods}
+        if normalized_methods and "generatecontent" not in normalized_methods:
+            continue
+        model_id = normalize_gemini_model_name(str(item.get("baseModelId") or item.get("name") or item.get("model") or "").strip())
+        if model_id and is_visible_gemini_model(model_id):
+            models.append(model_id)
+    return dedupe_preserve_text(models)
 
 
 def dedupe_preserve_text(items: list[str]) -> list[str]:

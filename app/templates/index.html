@@ -138,6 +138,7 @@
               <span>兼容格式</span>
               <select id="api-format" name="api_format">
                 <option value="openai" selected>OpenAI 兼容 / Chat Completions</option>
+                <option value="gemini">Google Gemini API / generateContent</option>
                 <option value="ollama">Ollama / 本地模型</option>
               </select>
             </label>
@@ -167,6 +168,27 @@
           <label class="field">
             <span>模型组（同一 API 地址可用模型，一行一个）</span>
             <textarea id="api-models" rows="3" spellcheck="false" placeholder="minimax-m25&#10;minimax-text-01&#10;minimax-reasoning"></textarea>
+          </label>
+          <label id="gemini-tier-filter-field" class="field hidden">
+            <span>Gemini 可用性</span>
+            <select id="gemini-tier-filter">
+              <option value="free">当前免费层可用</option>
+              <option value="restricted">显示但当前层无配额</option>
+              <option value="all">全部</option>
+            </select>
+          </label>
+          <label id="gemini-purpose-filter-field" class="field hidden">
+            <span>Gemini 模型用途</span>
+            <select id="gemini-purpose-filter">
+              <option value="text">文本生成</option>
+              <option value="tts">TTS / 语音输出</option>
+              <option value="image">图片 / 图像</option>
+              <option value="computer_use">Computer Use</option>
+              <option value="robotics">Robotics</option>
+              <option value="gemma">Gemma 开放模型</option>
+              <option value="other">其他模型</option>
+              <option value="all">全部用途</option>
+            </select>
           </label>
           <div class="model-group-actions">
             <button id="apply-model-group" type="button" class="secondary">确定模型组</button>
@@ -620,8 +642,8 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260619-01"></script>
-    <script src="/static/api-presets.js?v=20260618-01"></script>
+    <script src="/static/app.js?v=20260626-04"></script>
+    <script src="/static/api-presets.js?v=20260626-04"></script>
     <script src="/static/secret-toggle.js?v=20260616-16"></script>
   </body>
 </html>

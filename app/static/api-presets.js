@@ -8,12 +8,17 @@ const apiKeyInput = document.querySelector("#api-key");
 const apiModelInput = document.querySelector("#api-model");
 const apiModelsInput = document.querySelector("#api-models");
 const apiGpuModelInput = document.querySelector("#api-gpu-model");
+const geminiTierFilterField = document.querySelector("#gemini-tier-filter-field");
+const geminiTierFilterInput = document.querySelector("#gemini-tier-filter");
+const geminiPurposeFilterField = document.querySelector("#gemini-purpose-filter-field");
+const geminiPurposeFilterInput = document.querySelector("#gemini-purpose-filter");
 const applyModelGroupButton = document.querySelector("#apply-model-group");
 const fetchModelsButton = document.querySelector("#fetch-models");
 const modelGroupStatus = document.querySelector("#model-group-status");
 
 const savedConfigPresetName = "当前保存配置";
 const ollamaLocalBaseUrl = "http://host.docker.internal:11434";
+const geminiOfficialBaseUrl = "https://generativelanguage.googleapis.com/v1beta";
 const defaultApiPresets = [
   {
     name: "OpenAI 官方",
@@ -21,6 +26,32 @@ const defaultApiPresets = [
     base_url: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
     models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+    builtin: true,
+  },
+  {
+    name: "Google Gemini 官方",
+    format: "gemini",
+    base_url: geminiOfficialBaseUrl,
+    model: "gemini-3.5-flash",
+    gemini_tier_filter: "free",
+    gemini_purpose_filter: "text",
+    models: [
+      "gemini-3.5-flash",
+      "gemini-3-flash",
+      "gemini-3.1-flash-lite",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemini-2.5-flash-tts",
+      "gemini-3.1-flash-tts",
+      "gemini-robotics-er-1.6-preview",
+      "gemini-robotics-er-1.5-preview",
+      "gemma-4-26b",
+      "gemma-4-31b",
+      "gemini-2.5-pro",
+      "gemini-3.1-pro-preview",
+      "computer-use-preview",
+      "nano-banana",
+    ],
     builtin: true,
   },
   {
@@ -49,20 +80,58 @@ const defaultApiPresets = [
   },
 ];
 const defaultPresetNames = new Set(defaultApiPresets.map((preset) => preset.name));
+const geminiFreeTierModelIds = new Set([
+  "gemini-3.5-flash",
+  "gemini-3-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-3.1-flash-tts",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash-tts",
+  "gemini-2.5-flash-lite-preview-09-2025",
+  "gemini-robotics-er-1.6-preview",
+  "gemini-robotics-er-1.5-preview",
+  "gemma-4-26b",
+  "gemma-4-31b",
+]);
+const geminiRestrictedTierModelIds = new Set([
+  "computer-use-preview",
+  "nano-banana",
+  "gemini-2.5-pro",
+  "gemini-3.1-pro-preview",
+  "gemini-3.1-pro-preview-customtools",
+]);
+const deprecatedGeminiModelPrefixes = [
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+];
+const legacyGeminiAliasIds = new Set([
+  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
+]);
+const legacyGeminiPreviewPrefixes = [
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-2.5-flash-lite-preview",
+];
+const rawModelCatalogByFormat = Object.create(null);
 
 let apiPresets = loadApiPresets();
 let selectedApiPresetName = "";
 let isApplyingApiPreset = false;
 
 renderApiPresets();
+rememberModelCatalog(readModelGroup());
 updateModelOptions(readModelGroup());
 syncApiKeyVisibility();
+syncGeminiTierFilterControls();
 
 window.addEventListener("api-config-loaded", (event) => {
   syncApiPresetStateAfterLoad(event.detail || {});
 });
 
 apiModelsInput.addEventListener("input", () => {
+  rememberModelCatalog(readModelGroup());
   updateModelOptions(readModelGroup());
   modelGroupStatus.textContent = "模型组已修改，点击“确定模型组”后生效。";
   modelGroupStatus.className = "";
@@ -73,8 +142,17 @@ apiFormatInput.addEventListener("change", () => {
   selectedApiPresetName = "";
   renderApiPresets();
   syncApiKeyVisibility();
+  syncGeminiTierFilterControls();
   window.updateApiSummary?.();
   window.syncOllamaModelControls?.();
+});
+
+geminiTierFilterInput?.addEventListener("change", () => {
+  applyGeminiTierFilterToCurrentCatalog();
+});
+
+geminiPurposeFilterInput?.addEventListener("change", () => {
+  applyGeminiTierFilterToCurrentCatalog();
 });
 
 applyModelGroupButton.addEventListener("click", () => {
@@ -222,9 +300,191 @@ function canonicalizeApiPresets(presets) {
   return orderApiPresets(normalized);
 }
 
+function normalizeApiFormat(format) {
+  const value = String(format || "").trim().toLowerCase();
+  return ["openai", "gemini", "ollama"].includes(value) ? value : "openai";
+}
+
+function isOllamaFormat(format) {
+  return normalizeApiFormat(format) === "ollama";
+}
+
+function normalizeGeminiTierFilter(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "paid") return "restricted";
+  return ["all", "free", "restricted"].includes(normalized) ? normalized : "free";
+}
+
+function normalizeGeminiPurposeFilter(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["text", "tts", "image", "computer_use", "robotics", "gemma", "other", "all"].includes(normalized)
+    ? normalized
+    : "text";
+}
+
+function normalizeGeminiModelId(model) {
+  const value = String(model || "").trim();
+  return value.toLowerCase().startsWith("models/") ? value.slice(7) : value;
+}
+
+function isDeprecatedGeminiModel(model) {
+  const normalized = normalizeGeminiModelId(model).toLowerCase();
+  return deprecatedGeminiModelPrefixes.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}-`));
+}
+
+function isLegacyGeminiAliasModel(model) {
+  const normalized = normalizeGeminiModelId(model).toLowerCase();
+  return legacyGeminiAliasIds.has(normalized) || legacyGeminiPreviewPrefixes.some((prefix) => normalized.startsWith(prefix));
+}
+
+function isVisibleGeminiModel(model) {
+  const normalized = normalizeGeminiModelId(model).toLowerCase();
+  if (!normalized) return false;
+  return !isDeprecatedGeminiModel(normalized) && !isLegacyGeminiAliasModel(normalized);
+}
+
+function geminiModelPurpose(model) {
+  const normalized = normalizeGeminiModelId(model).toLowerCase();
+  if (!normalized) return "other";
+  if (normalized.includes("computer-use")) return "computer_use";
+  if (normalized.includes("robotics")) return "robotics";
+  if (normalized.startsWith("gemma")) return "gemma";
+  if (normalized.includes("tts") || normalized.includes("native-audio")) return "tts";
+  if (normalized.includes("nano-banana") || normalized.includes("preview-image") || normalized.includes("imagen") || normalized.includes("-image")) {
+    return "image";
+  }
+  if (
+    normalized.startsWith("gemini")
+    && !normalized.includes("robotics")
+    && !normalized.includes("computer-use")
+    && !normalized.includes("tts")
+    && !normalized.includes("image")
+  ) {
+    return "text";
+  }
+  return "other";
+}
+
+function geminiModelMatchesPurpose(model, purposeFilter = normalizeGeminiPurposeFilter(geminiPurposeFilterInput?.value)) {
+  const purpose = geminiModelPurpose(model);
+  if (purposeFilter === "all") return true;
+  if (purposeFilter === "text") {
+    return purpose === "text" || purpose === "gemma";
+  }
+  return purpose === purposeFilter;
+}
+
+function geminiModelTier(model) {
+  const normalized = normalizeGeminiModelId(model).toLowerCase();
+  if (geminiFreeTierModelIds.has(normalized)) return "free";
+  if (geminiRestrictedTierModelIds.has(normalized)) return "restricted";
+  if (normalized.includes("computer-use")) return "restricted";
+  if (normalized.includes("nano-banana") || normalized.includes("preview-image")) return "restricted";
+  if (normalized.includes("-pro") && !normalized.includes("flash")) return "restricted";
+  if (normalized.includes("robotics")) return "free";
+  if (normalized.startsWith("gemma")) return "free";
+  if (normalized.includes("tts")) return "free";
+  if (normalized.includes("flash")) return "free";
+  return "unknown";
+}
+
+function rememberModelCatalog(models, format = normalizeApiFormat(apiFormatInput.value)) {
+  const normalized = normalizeModelListForFormat(models, format);
+  rawModelCatalogByFormat[format] = format === "gemini"
+    ? normalized.filter((model) => isVisibleGeminiModel(model))
+    : normalized;
+}
+
+function geminiTierFilterLabel(filter = normalizeGeminiTierFilter(geminiTierFilterInput?.value)) {
+  if (filter === "free") return "当前免费层可用";
+  if (filter === "restricted") return "显示但当前层无配额";
+  return "全部";
+}
+
+function geminiPurposeFilterLabel(filter = normalizeGeminiPurposeFilter(geminiPurposeFilterInput?.value)) {
+  if (filter === "text") return "文本生成";
+  if (filter === "tts") return "TTS / 语音输出";
+  if (filter === "image") return "图片 / 图像";
+  if (filter === "computer_use") return "Computer Use";
+  if (filter === "robotics") return "Robotics";
+  if (filter === "gemma") return "Gemma 开放模型";
+  if (filter === "other") return "其他模型";
+  return "全部用途";
+}
+
+function countGeminiModelsByTier(models) {
+  return normalizeModelListForFormat(models, "gemini").reduce((counts, model) => {
+    if (!isVisibleGeminiModel(model)) return counts;
+    counts[geminiModelTier(model)] += 1;
+    return counts;
+  }, { free: 0, restricted: 0, unknown: 0 });
+}
+
+function countGeminiModelsByPurpose(models) {
+  return normalizeModelListForFormat(models, "gemini").reduce((counts, model) => {
+    if (!isVisibleGeminiModel(model)) return counts;
+    const purpose = geminiModelPurpose(model);
+    counts[purpose] = (counts[purpose] || 0) + 1;
+    if (purpose === "gemma") {
+      counts.text = (counts.text || 0) + 1;
+    }
+    return counts;
+  }, { text: 0, tts: 0, image: 0, computer_use: 0, robotics: 0, gemma: 0, other: 0 });
+}
+
+function filterGeminiModelsByTier(models, tierFilter = normalizeGeminiTierFilter(geminiTierFilterInput?.value)) {
+  const normalized = normalizeModelListForFormat(models, "gemini").filter((model) => isVisibleGeminiModel(model));
+  if (tierFilter === "all") return normalized;
+  return normalized.filter((model) => geminiModelTier(model) === tierFilter);
+}
+
+function filterGeminiModelsByPurpose(models, purposeFilter = normalizeGeminiPurposeFilter(geminiPurposeFilterInput?.value)) {
+  const normalized = normalizeModelListForFormat(models, "gemini").filter((model) => isVisibleGeminiModel(model));
+  if (purposeFilter === "all") return normalized;
+  return normalized.filter((model) => geminiModelMatchesPurpose(model, purposeFilter));
+}
+
+function visibleModelsForFormat(models, format = normalizeApiFormat(apiFormatInput.value)) {
+  const normalized = normalizeModelListForFormat(models, format);
+  if (format !== "gemini") return normalized;
+  return filterGeminiModelsByPurpose(filterGeminiModelsByTier(normalized));
+}
+
+function syncGeminiTierFilterControls() {
+  const isGemini = normalizeApiFormat(apiFormatInput.value) === "gemini";
+  geminiTierFilterField?.classList.toggle("hidden", !isGemini);
+  geminiPurposeFilterField?.classList.toggle("hidden", !isGemini);
+  if (geminiTierFilterInput) geminiTierFilterInput.disabled = !isGemini;
+  if (geminiPurposeFilterInput) geminiPurposeFilterInput.disabled = !isGemini;
+  if (!isGemini) return;
+  applyGeminiTierFilterToCurrentCatalog({ silent: true });
+}
+
+function applyGeminiTierFilterToCurrentCatalog({ silent = false } = {}) {
+  if (normalizeApiFormat(apiFormatInput.value) !== "gemini") return;
+  const rawModels = rawModelCatalogByFormat.gemini?.length
+    ? rawModelCatalogByFormat.gemini
+    : normalizeModelListForFormat(apiModelsInput.value, "gemini");
+  const visibleModels = filterGeminiModelsByTier(rawModels);
+  const filteredByPurpose = filterGeminiModelsByPurpose(visibleModels);
+  const tierCounts = countGeminiModelsByTier(rawModels);
+  const purposeCounts = countGeminiModelsByPurpose(rawModels);
+  apiModelsInput.value = filteredByPurpose.join("\n");
+  updateModelOptions(filteredByPurpose, apiModelInput.value.trim());
+  if (silent) return;
+  modelGroupStatus.className = filteredByPurpose.length ? "ok-text" : "";
+  if (!filteredByPurpose.length && rawModels.length) {
+    modelGroupStatus.textContent = `当前过滤条件下没有匹配模型。已识别免费层 ${tierCounts.free} 个、当前层无配额 ${tierCounts.restricted} 个；文本 ${purposeCounts.text}、TTS ${purposeCounts.tts}、图片 ${purposeCounts.image}。`;
+    return;
+  }
+  modelGroupStatus.textContent = `当前按“${geminiTierFilterLabel()} + ${geminiPurposeFilterLabel()}”显示 ${filteredByPurpose.length} 个模型。`;
+}
+
 function normalizeApiPreset(preset) {
   const name = String(preset?.name || "").trim();
-  const format = preset?.format === "ollama" ? "ollama" : "openai";
+  const format = normalizeApiFormat(preset?.format);
+  const gemini_tier_filter = normalizeGeminiTierFilter(preset?.gemini_tier_filter);
+  const gemini_purpose_filter = normalizeGeminiPurposeFilter(preset?.gemini_purpose_filter);
   const base_url = normalizePresetBaseUrl(preset?.base_url, format);
   let models = normalizeModelListForFormat(preset?.models || preset?.model || "", format);
   let model = normalizeModelName(String(preset?.model || "").trim(), format);
@@ -249,14 +509,19 @@ function normalizeApiPreset(preset) {
     base_url,
     model,
     models,
-    api_key: format === "ollama" ? "" : String(preset?.api_key || ""),
-    gpu_model: format === "ollama" ? String(preset?.gpu_model || "").trim() : "",
+    api_key: isOllamaFormat(format) ? "" : String(preset?.api_key || ""),
+    gpu_model: isOllamaFormat(format) ? String(preset?.gpu_model || "").trim() : "",
+    gemini_tier_filter,
+    gemini_purpose_filter,
     builtin: Boolean(preset?.builtin),
   };
 }
 
 function normalizePresetBaseUrl(baseUrl, format) {
   let value = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (format === "gemini" && /^https?:\/\/generativelanguage\.googleapis\.com$/i.test(value)) {
+    return geminiOfficialBaseUrl;
+  }
   if (format !== "ollama") return value;
   if (/^https?:\/\/(?:localhost|127\.0\.0\.1):11434$/i.test(value)) {
     return ollamaLocalBaseUrl;
@@ -316,10 +581,11 @@ function orderedApiPresets() {
 function orderApiPresets(presets) {
   const priority = new Map([
     ["OpenAI 官方", 0],
-    ["本机 OpenAI 兼容", 1],
-    ["Ollama 本机", 2],
-    ["DeepSeek 兼容", 3],
-    [savedConfigPresetName, 4],
+    ["Google Gemini 官方", 1],
+    ["本机 OpenAI 兼容", 2],
+    ["Ollama 本机", 3],
+    ["DeepSeek 兼容", 4],
+    [savedConfigPresetName, 5],
   ]);
 
   return [...presets].sort((left, right) => {
@@ -332,7 +598,7 @@ function orderApiPresets(presets) {
 }
 
 function applyApiPreset(preset) {
-  const models = normalizeModelListForFormat(preset.models || preset.model || "", preset.format || "openai");
+  const models = normalizeModelListForFormat(preset.models || preset.model || "", normalizeApiFormat(preset.format));
   const mergedConfig = {
     ...preset,
     models,
@@ -355,23 +621,34 @@ function applyApiPreset(preset) {
 }
 
 function applyConfigToForm(config, options = {}) {
-  const format = config.format || "openai";
+  const format = normalizeApiFormat(config.format);
+  const geminiTierFilter = normalizeGeminiTierFilter(config.gemini_tier_filter);
+  const geminiPurposeFilter = normalizeGeminiPurposeFilter(config.gemini_purpose_filter);
   const model = normalizeModelName(config.model || "", format);
   const models = normalizeModelListForFormat(config.models || model || "", format);
 
   apiFormatInput.value = format;
+  if (geminiTierFilterInput) {
+    geminiTierFilterInput.value = geminiTierFilter;
+  }
+  if (geminiPurposeFilterInput) {
+    geminiPurposeFilterInput.value = geminiPurposeFilter;
+  }
   apiBaseUrlInput.value = normalizePresetBaseUrl(config.base_url || "", format);
   if (!options.preserveBuiltinKey || !config.builtin) {
-    apiKeyInput.value = format === "ollama" ? "" : (config.api_key || "");
-  } else if (format === "ollama") {
+    apiKeyInput.value = isOllamaFormat(format) ? "" : (config.api_key || "");
+  } else if (isOllamaFormat(format)) {
     apiKeyInput.value = "";
   }
   if (apiGpuModelInput) {
-    apiGpuModelInput.value = format === "ollama" ? (config.gpu_model || "") : "";
+    apiGpuModelInput.value = isOllamaFormat(format) ? (config.gpu_model || "") : "";
   }
-  apiModelsInput.value = models.join("\n");
-  replaceModelOptions(models, model || models[0] || "");
+  rememberModelCatalog(models, format);
+  const visibleModels = visibleModelsForFormat(models, format);
+  apiModelsInput.value = visibleModels.join("\n");
+  replaceModelOptions(visibleModels, model || visibleModels[0] || "");
   syncApiKeyVisibility();
+  syncGeminiTierFilterControls();
 }
 
 function withApiPresetGuard(callback) {
@@ -397,6 +674,8 @@ function syncApiPresetStateAfterLoad(config = {}) {
         ...normalizedConfig,
         name: matchingPreset.name,
         builtin: false,
+        gemini_tier_filter: normalizedConfig.gemini_tier_filter || matchingPreset.gemini_tier_filter || "free",
+        gemini_purpose_filter: normalizedConfig.gemini_purpose_filter || matchingPreset.gemini_purpose_filter || "text",
         models: normalizeModelListForFormat(
           [
             ...(matchingPreset.models || []),
@@ -414,6 +693,8 @@ function syncApiPresetStateAfterLoad(config = {}) {
       {
         ...matchingPreset,
         ...normalizedConfig,
+        gemini_tier_filter: normalizedConfig.gemini_tier_filter || matchingPreset.gemini_tier_filter || "free",
+        gemini_purpose_filter: normalizedConfig.gemini_purpose_filter || matchingPreset.gemini_purpose_filter || "text",
         models: normalizeModelListForFormat(
           [
             ...(matchingPreset.models || []),
@@ -441,12 +722,13 @@ function syncApiPresetStateAfterLoad(config = {}) {
 
   renderApiPresets();
   syncApiKeyVisibility();
+  syncGeminiTierFilterControls();
   window.updateApiSummary?.();
   window.syncOllamaModelControls?.();
 }
 
 function normalizeLoadedConfig(config = {}) {
-  const format = config.format === "ollama" ? "ollama" : "openai";
+  const format = normalizeApiFormat(config.format);
   let base_url = normalizePresetBaseUrl(config.base_url || "", format);
   let model = normalizeModelName(config.model || "", format);
   let models = normalizeModelListForFormat(config.models || model || "", format);
@@ -454,8 +736,14 @@ function normalizeLoadedConfig(config = {}) {
   if (format === "ollama" && (!base_url || isDeprecatedApiPreset({ name: "", format, base_url }))) {
     base_url = ollamaLocalBaseUrl;
   }
+  if (format === "gemini" && !base_url) {
+    base_url = geminiOfficialBaseUrl;
+  }
   if (format === "ollama" && !model) {
     model = defaultApiPresets.find((preset) => preset.name === "Ollama 本机")?.model || "";
+  }
+  if (format === "gemini" && !model) {
+    model = defaultApiPresets.find((preset) => preset.name === "Google Gemini 官方")?.model || "";
   }
   if (model && !models.includes(model)) {
     models = normalizeModelListForFormat([model, ...models], format);
@@ -466,13 +754,19 @@ function normalizeLoadedConfig(config = {}) {
     base_url,
     model,
     models,
-    api_key: format === "ollama" ? "" : String(config.api_key || ""),
-    gpu_model: format === "ollama" ? String(config.gpu_model || "").trim() : "",
+    api_key: isOllamaFormat(format) ? "" : String(config.api_key || ""),
+    gpu_model: isOllamaFormat(format) ? String(config.gpu_model || "").trim() : "",
+    gemini_tier_filter: Object.prototype.hasOwnProperty.call(config, "gemini_tier_filter")
+      ? normalizeGeminiTierFilter(config.gemini_tier_filter)
+      : (format === "gemini" ? "free" : ""),
+    gemini_purpose_filter: Object.prototype.hasOwnProperty.call(config, "gemini_purpose_filter")
+      ? normalizeGeminiPurposeFilter(config.gemini_purpose_filter)
+      : (format === "gemini" ? "text" : ""),
   };
 }
 
 function findBestPresetMatch(config = {}) {
-  const format = config.format || "openai";
+  const format = normalizeApiFormat(config.format);
   const baseUrl = normalizePresetBaseUrl(config.base_url || "", format);
   const model = normalizeModelName(config.model || "", format);
 
@@ -495,25 +789,33 @@ function upsertApiPreset(preset) {
 }
 
 function readCurrentApiPreset() {
-  const format = apiFormatInput.value === "ollama" ? "ollama" : "openai";
+  const format = normalizeApiFormat(apiFormatInput.value);
   const model = normalizeModelName(apiModelInput.value, format);
-  const models = normalizeModelListForFormat([...readModelGroup(), model], format);
+  const sourceModels = format === "gemini"
+    ? (rawModelCatalogByFormat.gemini?.length ? rawModelCatalogByFormat.gemini : [...readModelGroup(), model])
+    : [...readModelGroup(), model];
+  const models = normalizeModelListForFormat(sourceModels, format);
 
   return {
     format,
     base_url: normalizePresetBaseUrl(apiBaseUrlInput.value, format),
-    api_key: format === "ollama" ? "" : apiKeyInput.value,
+    api_key: isOllamaFormat(format) ? "" : apiKeyInput.value,
     model,
-    gpu_model: format === "ollama" ? (apiGpuModelInput?.value.trim() || "") : "",
+    gpu_model: isOllamaFormat(format) ? (apiGpuModelInput?.value.trim() || "") : "",
+    gemini_tier_filter: normalizeGeminiTierFilter(geminiTierFilterInput?.value),
+    gemini_purpose_filter: normalizeGeminiPurposeFilter(geminiPurposeFilterInput?.value),
     models,
   };
 }
 
 function syncApiKeyVisibility() {
-  const isOllama = apiFormatInput.value === "ollama";
+  const format = normalizeApiFormat(apiFormatInput.value);
+  const isOllama = isOllamaFormat(format);
   apiKeyField.classList.remove("hidden");
   apiKeyInput.disabled = false;
-  apiKeyInput.placeholder = isOllama ? "Ollama 本地接口可留空" : "sk-...";
+  apiKeyInput.placeholder = isOllama
+    ? "Ollama 本地接口可留空"
+    : (format === "gemini" ? "AIza..." : "sk-...");
 }
 
 function findApiPreset(name) {
@@ -594,18 +896,33 @@ function replaceModelOptions(optionModels, currentModel = "") {
 }
 
 function applyModelGroup() {
+  const format = normalizeApiFormat(apiFormatInput.value);
   const models = readModelGroup();
   if (!models.length) {
     modelGroupStatus.className = "error-text";
     modelGroupStatus.textContent = "请先填写至少一个模型。";
     return false;
   }
-  updateModelOptions(models);
-  if (!models.includes(apiModelInput.value.trim())) {
-    apiModelInput.value = models[0];
+  rememberModelCatalog(models, format);
+  const visibleModels = visibleModelsForFormat(models, format);
+  if (!visibleModels.length) {
+    modelGroupStatus.className = "error-text";
+    modelGroupStatus.textContent = "当前过滤条件下没有匹配模型，请切换 Gemini 可用性/用途过滤后再试。";
+    return false;
+  }
+  apiModelsInput.value = visibleModels.join("\n");
+  updateModelOptions(visibleModels);
+  if (!visibleModels.includes(apiModelInput.value.trim())) {
+    apiModelInput.value = visibleModels[0];
   }
   modelGroupStatus.className = "ok-text";
-  modelGroupStatus.textContent = `已确定 ${models.length} 个模型，当前模型：${apiModelInput.value}`;
+  if (format === "gemini") {
+    const tierCounts = countGeminiModelsByTier(models);
+    const purposeCounts = countGeminiModelsByPurpose(models);
+    modelGroupStatus.textContent = `已确定 ${models.length} 个 Gemini 模型；当前按“${geminiTierFilterLabel()} + ${geminiPurposeFilterLabel()}”显示 ${visibleModels.length} 个（免费层 ${tierCounts.free} / 当前层无配额 ${tierCounts.restricted} / 文本 ${purposeCounts.text} / TTS ${purposeCounts.tts} / 图片 ${purposeCounts.image}）。`;
+  } else {
+    modelGroupStatus.textContent = `已确定 ${visibleModels.length} 个模型，当前模型：${apiModelInput.value}`;
+  }
   return true;
 }
 
@@ -619,19 +936,30 @@ async function fetchAvailableModels() {
     if (!response.ok) {
       throw new Error(payload.detail || "获取模型失败");
     }
-    const format = apiFormatInput.value === "ollama" ? "ollama" : "openai";
+    const format = normalizeApiFormat(apiFormatInput.value);
     const models = normalizeModelListForFormat(payload.models || [], format);
     if (!models.length) {
       throw new Error("接口没有返回可用模型。");
     }
-    apiModelsInput.value = models.join("\n");
-    updateModelOptions(models);
-    if (!models.includes(apiModelInput.value.trim())) {
-      apiModelInput.value = models[0];
+    rememberModelCatalog(models, format);
+    const visibleModels = visibleModelsForFormat(models, format);
+    if (!visibleModels.length) {
+      throw new Error(`接口已返回模型，但当前过滤条件“${geminiTierFilterLabel()} + ${geminiPurposeFilterLabel()}”下没有可显示项。`);
+    }
+    apiModelsInput.value = visibleModels.join("\n");
+    updateModelOptions(visibleModels);
+    if (!visibleModels.includes(apiModelInput.value.trim())) {
+      apiModelInput.value = visibleModels[0];
     }
     saveFetchedModelsToPreset(models);
     modelGroupStatus.className = "ok-text";
-    modelGroupStatus.textContent = payload.message || `已获取 ${models.length} 个模型。`;
+    if (format === "gemini") {
+      const tierCounts = countGeminiModelsByTier(models);
+      const purposeCounts = countGeminiModelsByPurpose(models);
+      modelGroupStatus.textContent = `已获取 ${models.length} 个 Gemini 模型；当前按“${geminiTierFilterLabel()} + ${geminiPurposeFilterLabel()}”显示 ${visibleModels.length} 个（免费层 ${tierCounts.free} / 当前层无配额 ${tierCounts.restricted}${tierCounts.unknown ? ` / 未归类 ${tierCounts.unknown}` : ""} / 文本 ${purposeCounts.text} / TTS ${purposeCounts.tts} / 图片 ${purposeCounts.image} / Computer Use ${purposeCounts.computer_use} / Robotics ${purposeCounts.robotics} / Gemma ${purposeCounts.gemma}）。`;
+    } else {
+      modelGroupStatus.textContent = payload.message || `已获取 ${visibleModels.length} 个模型。`;
+    }
   } catch (error) {
     modelGroupStatus.className = "error-text";
     modelGroupStatus.textContent = humanFetchError(error);
